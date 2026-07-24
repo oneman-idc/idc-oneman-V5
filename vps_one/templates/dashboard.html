@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>服务器管理｜VPS-ONEMAN</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="nav"><div class="container"><a class="brand" href="/"><b>VPS</b>-ONE</a><div class="links"><span class="muted">用户 #{{ user.uid }}</span><a class="btn" href="/#plans">购买云主机</a></div></div></header>
+<main class="section"><div class="container console-main">
+  <div class="section-head"><div><span class="eyebrow">服务器管理</span><h1>我的云主机</h1></div><p>本来应该从从容容，游刃有余，不要着急...</p></div>
+  {% if request.query_params.get('password_reset') %}<div class="notice success-text">SSH 密码已重置，完整云主机信息已发送至您的注册邮箱。</div>{% endif %}
+  {% if request.query_params.get('mail_failed') %}<div class="notice danger">SSH 密码已成功重置，但邮件发送失败。请联系管理员检查配置。</div>{% endif %}
+  {% if cards %}<div class="instance-grid simple-grid">
+  {% for card in cards %}{% set instance = card.instance %}{% set package = card.package %}{% set access = card.access %}
+  <article class="card simple-instance">
+    <div class="row instance-heading"><div><span class="eyebrow">{{ instance.name }}</span><h2>主机名</h2></div><span class="status status-{{ instance.status }}"><i></i>{{ status_label(instance.status) }}</span></div>
+    <div class="host-facts"><div><small>到期时间</small><strong>{{ instance.expires_at.strftime('%Y-%m-%d') if instance.expires_at else '待同步' }}</strong></div><div><small>服务标识</small><code>{{ instance.clicd_id }}</code></div></div>
+    <section class="instance-information" aria-label="容器连接信息">
+      <h3>机密信息</h3><dl class="fact-list"><div><dt>公网 IP</dt><dd><code>{{ card.ip }}</code></dd></div><div><dt>IPv6</dt><dd><code>{{ card.ipv6 }}</code></dd></div><div><dt>SSH 端口</dt><dd><code>{{ card.ssh_port }}</code></dd></div><div><dt>SSH 密码</dt><dd><code>{{ card.ssh_password }}</code></dd></div></dl>
+      <h3>机器配置</h3><dl class="fact-list"><div><dt>套餐</dt><dd>{{ package.get('name') or '未返回' }}</dd></div><div><dt>基础资源</dt><dd>{{ package.get('cpu') or 0 }} 核 / {{ package.get('memory_mb') or 0 }} MB / {{ package.get('disk_gb') or 0 }} GB</dd></div><div><dt>流量</dt><dd>{{ package.get('traffic_gb') or 0 }} GB</dd></div><div><dt>带宽</dt><dd>↓ {{ package.get('network_down_mbps') or 0 }} / ↑ {{ package.get('network_up_mbps') or 0 }} Mbps</dd></div><div><dt>操作系统</dt><dd>{{ card.operating_system }}</dd></div></dl>
+      <h3>控制台信息</h3><dl class="fact-list"><div><dt>用户名</dt><dd><code>{{ access.get('username') or '未返回' }}</code></dd></div><div><dt>初始密码</dt><dd><code>{{ access.get('password') or '未返回' }}</code></dd></div><div><dt>访问码</dt><dd><code>{{ access.get('access_code') or '未返回' }}</code></dd></div><div><dt>访问链接</dt><dd>{% if access.get('management_url') %}<a class="text-link" href="{{ access.management_url }}" target="_blank" rel="noopener noreferrer">打开访问链接</a>{% else %}未返回{% endif %}</dd></div></dl>
+    </section>
+    <div class="power-actions"><form method="post" action="/instances/{{ instance.id }}/actions/start"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary" {% if instance.status in ['running','starting'] %}disabled{% endif %}>开机</button></form><form method="post" action="/instances/{{ instance.id }}/actions/stop"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn" {% if instance.status in ['stopped','stopping'] %}disabled{% endif %}>关机</button></form><form method="post" action="/instances/{{ instance.id }}/actions/restart"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn" {% if instance.status != 'running' %}disabled{% endif %}>重启</button></form><form method="post" action="/instances/{{ instance.id }}/actions/reset-password"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn dark" type="submit">重置 SSH 密码</button></form></div>
+    <p class="sync-note">*请重置SSH密码，查收邮件</p>
+  </article>{% endfor %}</div>{% else %}<div class="empty">暂无已交付主机，支付完成后系统会自动创建并启动鸡鸡。</div>{% endif %}
+  {% set pending = orders|selectattr('status','in',['pending','paid','provisioning'])|list %}{% if pending %}<section class="pending-orders"><div class="section-head compact"><div><span class="eyebrow">处理中</span><h2>待交付订单</h2></div></div><div class="order-list">{% for order in pending %}<div class="order-row"><strong>{{ order.order_no }}</strong><span class="pill">{{ order.status }}</span>{% if jobs.get(order.id) and jobs[order.id].error %}<small>{{ jobs[order.id].error }}</small>{% endif %}</div>{% endfor %}</div></section>{% endif %}
+</div></main>
+</body>
+</html>
