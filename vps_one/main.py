@@ -13,17 +13,18 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
+from websockets.asyncio.client import connect as websocket_connect
 
 from .config import settings
 from .database import SessionLocal, init_db, session, write_lock
 from .models import Audit, Instance, Job, Order, PaymentEvent, Plan, User
 from .security import csrf_token, decrypt, encrypt, hash_password, read_session, session_token, valid_csrf, verify_password
-from .services.clicd import CLICD, CLICDError, container_details, container_items, container_status, extract_access, normalize_virtualization, plan_payload, unwrap_data
+from .services.clicd import CLICD, CLICDError, CLICD_USER_AGENT, container_details, container_items, container_status, extract_access, normalize_virtualization, plan_payload, unwrap_data
 from .services.hashpay import HashPay
 from .services.mailer import send_mail
 from .services.settings import get, set_many
@@ -33,6 +34,7 @@ root = Path(__file__).parent
 templates = Jinja2Templates(root / "templates")
 rate_buckets: dict[str, list[float]] = {}
 logger = logging.getLogger("vps_one.worker")
+VNC_SESSION_TTL = 55
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,36 @@ class CLICDNode:
 
     def client(self) -> CLICD:
         return CLICD(self.base_url, self.token)
+
+
+@dataclass(frozen=True)
+class VNCSession:
+    user_id: int
+    instance_id: int
+    node_url: str
+    container_name: str
+    clicd_ticket: str
+    expires_at: float
+
+
+vnc_sessions: dict[str, VNCSession] = {}
+
+
+def create_vnc_session(user_id: int, instance_id: int, node_url: str, container_name: str, clicd_ticket: str) -> str:
+    now = time.monotonic()
+    for token, value in list(vnc_sessions.items()):
+        if value.expires_at <= now:
+            vnc_sessions.pop(token, None)
+    token = secrets.token_urlsafe(32)
+    vnc_sessions[token] = VNCSession(user_id, instance_id, node_url, container_name, clicd_ticket, now + VNC_SESSION_TTL)
+    return token
+
+
+def consume_vnc_session(token: str, user_id: int, instance_id: int) -> VNCSession | None:
+    value = vnc_sessions.pop(token, None)
+    if not value or value.expires_at <= time.monotonic():
+        return None
+    return value if value.user_id == user_id and value.instance_id == instance_id else None
 
 
 def setting_lines(value: str) -> list[str]:
@@ -183,6 +215,12 @@ def check_csrf(request: Request, value: str):
         raise HTTPException(419, "CSRF 校验失败")
 
 
+def websocket_origin_allowed(websocket: WebSocket) -> bool:
+    origin = urlparse(websocket.headers.get("origin", ""))
+    host = (websocket.headers.get("x-forwarded-host") or websocket.headers.get("host") or "").split(",", 1)[0].strip().lower()
+    return origin.scheme in {"http", "https"} and origin.netloc.lower() == host
+
+
 def limit(request: Request, key: str, maximum: int, window: int = 60):
     now = time.monotonic()
     bucket_key = f"{key}:{request.client.host if request.client else 'unknown'}"
@@ -256,10 +294,13 @@ def instance_card(instance: Instance, order: Order, plan: Plan, remote: dict | N
     details = container_details(remote or {})
     access = instance_access(instance)
     package = snapshot_data(order, plan)
+    virtualization = details.get("virtualization") or normalize_virtualization(package.get("virtualization")) or normalize_virtualization(plan.virtualization)
     return {
         "instance": instance,
         "package": package,
         "operating_system": details.get("operating_system") or package.get("clicd_image") or "未返回",
+        "virtualization": virtualization,
+        "is_kvm": virtualization == "kvm",
         "ip": details.get("ip") or instance.ip or "未分配",
         "ipv6": details.get("ipv6") or instance.ipv6 or "未分配",
         "ssh_port": details.get("ssh_port") or instance.ssh_port or 22,
@@ -661,6 +702,98 @@ async def instance_credentials(instance_id: int, request: Request, db=Depends(se
     db.add(Audit(user_id=user["uid"], action="instance.access.view", detail=str(instance_id), ip=request.client.host if request.client else ""))
     await db.commit()
     return JSONResponse({"instance": instance.name, "username": credentials.get("username", ""), "password": credentials.get("password", ""), "access_code": credentials.get("access_code", ""), "management_url": credentials.get("management_url", "")}, headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
+
+
+@app.post("/instances/{instance_id}/vnc-session")
+async def instance_vnc_session(instance_id: int, request: Request, csrf: str = Form(), db=Depends(session)):
+    user = guard(request)
+    check_csrf(request, csrf)
+    limit(request, "instance-vnc", 10, 60)
+    instance = await db.get(Instance, instance_id)
+    if not instance or instance.user_id != user["uid"]:
+        raise HTTPException(404)
+    if not instance.clicd_id:
+        raise HTTPException(409, "实例尚未完成交付")
+    plan = await db.get(Plan, instance.plan_id)
+    node = await node_for_instance(db, instance)
+    client = node.client()
+    try:
+        remote = unwrap_data(await client.get(instance.clicd_id))
+        if not isinstance(remote, dict):
+            raise CLICDError("CLICD 实例响应格式无效")
+        virtualization = normalize_virtualization(remote.get("virtualization") or remote.get("type")) or normalize_virtualization(plan.virtualization if plan else "")
+        if virtualization != "kvm":
+            raise HTTPException(400, "WebVNC 仅适用于 KVM 虚拟机")
+        if container_status(remote) != "running":
+            raise HTTPException(409, "请先启动 KVM 虚拟机再连接 VNC")
+        container_name = str(remote.get("name") or remote.get("container_name") or "")
+        if not container_name:
+            raise CLICDError("CLICD 未返回实例名称")
+        clicd_ticket = await client.vnc_ticket(container_name)
+    except HTTPException:
+        raise
+    except CLICDError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    token = create_vnc_session(user["uid"], instance.id, node.base_url, container_name, clicd_ticket)
+    db.add(Audit(user_id=user["uid"], action="instance.vnc.session", detail=str(instance_id), ip=request.client.host if request.client else ""))
+    await db.commit()
+    return JSONResponse({"websocket_url": f"/instances/{instance.id}/vnc?session={token}", "instance": instance.name}, headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
+
+
+@app.websocket("/instances/{instance_id}/vnc")
+async def instance_vnc_proxy(websocket: WebSocket, instance_id: int):
+    user = read_session(websocket.cookies.get("vps_session"))
+    if not user or not websocket_origin_allowed(websocket):
+        await websocket.close(code=4403)
+        return
+    pending = consume_vnc_session(websocket.query_params.get("session", ""), int(user["uid"]), instance_id)
+    if not pending:
+        await websocket.close(code=4401)
+        return
+    try:
+        async with SessionLocal() as db:
+            node = find_clicd_node(await clicd_nodes(db), pending.node_url)
+        client = node.client()
+        async with websocket_connect(
+            client.vnc_websocket_url(pending.container_name),
+            subprotocols=["binary", f"clicd-vnc-ticket.{pending.clicd_ticket}"],
+            user_agent_header=CLICD_USER_AGENT,
+            compression=None,
+            proxy=None,
+            max_size=None,
+            open_timeout=10,
+        ) as upstream:
+            requested_protocols = websocket.headers.get("sec-websocket-protocol", "")
+            await websocket.accept(subprotocol="binary" if "binary" in requested_protocols else None)
+
+            async def browser_to_clicd():
+                while True:
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        return
+                    if message.get("bytes") is not None:
+                        await upstream.send(message["bytes"])
+                    elif message.get("text") is not None:
+                        await upstream.send(message["text"])
+
+            async def clicd_to_browser():
+                async for message in upstream:
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+
+            tasks = {asyncio.create_task(browser_to_clicd()), asyncio.create_task(clicd_to_browser())}
+            _, pending_tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending_tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as exc:
+        logger.warning("实例 %s WebVNC 代理断开：%s", instance_id, exc.__class__.__name__)
+        try:
+            await websocket.close(code=1011, reason="WebVNC 上游连接失败")
+        except RuntimeError:
+            pass
 
 
 @app.post("/instances/{instance_id}/actions/{action}")
