@@ -44,7 +44,7 @@ class Plan(Base):
     clicd_template_name: Mapped[str] = mapped_column(String(200), default="")
     clicd_validated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     assign_nat: Mapped[bool] = mapped_column(Boolean, default=True)
-    port_mapping_count: Mapped[int] = mapped_column(Integer, default=1)
+    port_mapping_count: Mapped[int] = mapped_column(Integer, default=2)
     assign_ipv4: Mapped[bool] = mapped_column(Boolean, default=False)
     ipv4_count: Mapped[int] = mapped_column(Integer, default=0)
     assign_ipv6: Mapped[bool] = mapped_column(Boolean, default=True)

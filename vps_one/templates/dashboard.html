@@ -22,10 +22,86 @@
       <h3>机器配置</h3><dl class="fact-list"><div><dt>套餐</dt><dd>{{ package.get('name') or '未返回' }}</dd></div><div><dt>基础资源</dt><dd>{{ package.get('cpu') or 0 }} 核 / {{ package.get('memory_mb') or 0 }} MB / {{ package.get('disk_gb') or 0 }} GB</dd></div><div><dt>流量</dt><dd>{{ package.get('traffic_gb') or 0 }} GB</dd></div><div><dt>带宽</dt><dd>↓ {{ package.get('network_down_mbps') or 0 }} / ↑ {{ package.get('network_up_mbps') or 0 }} Mbps</dd></div><div><dt>操作系统</dt><dd>{{ card.operating_system }}</dd></div></dl>
       <h3>控制台信息</h3><dl class="fact-list"><div><dt>用户名</dt><dd><code>{{ access.get('username') or '未返回' }}</code></dd></div><div><dt>初始密码</dt><dd><code>{{ access.get('password') or '未返回' }}</code></dd></div><div><dt>访问码</dt><dd><code>{{ access.get('access_code') or '未返回' }}</code></dd></div><div><dt>访问链接</dt><dd>{% if access.get('management_url') %}<a class="text-link" href="{{ access.management_url }}" target="_blank" rel="noopener noreferrer">打开访问链接</a>{% else %}未返回{% endif %}</dd></div></dl>
     </section>
-    <div class="power-actions"><form method="post" action="/instances/{{ instance.id }}/actions/start"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary" {% if instance.status in ['running','starting'] %}disabled{% endif %}>开机</button></form><form method="post" action="/instances/{{ instance.id }}/actions/stop"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn" {% if instance.status in ['stopped','stopping'] %}disabled{% endif %}>关机</button></form><form method="post" action="/instances/{{ instance.id }}/actions/restart"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn" {% if instance.status != 'running' %}disabled{% endif %}>重启</button></form><form method="post" action="/instances/{{ instance.id }}/actions/reset-password"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn dark" type="submit">重置 SSH 密码</button></form></div>
+    <div class="power-actions"><form method="post" action="/instances/{{ instance.id }}/actions/start"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary" {% if instance.status in ['running','starting'] %}disabled{% endif %}>开机</button></form><form method="post" action="/instances/{{ instance.id }}/actions/stop"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn" {% if instance.status in ['stopped','stopping'] %}disabled{% endif %}>关机</button></form><form method="post" action="/instances/{{ instance.id }}/actions/restart"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn" {% if instance.status != 'running' %}disabled{% endif %}>重启</button></form><form method="post" action="/instances/{{ instance.id }}/actions/reset-password"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn dark" type="submit">重置 SSH 密码</button></form>{% if card.is_kvm %}<button class="btn ghost vnc-launch" type="button" data-instance-name="{{ instance.name }}" data-session-url="/instances/{{ instance.id }}/vnc-session" data-csrf="{{ csrf }}" {% if instance.status != 'running' %}disabled title="请先启动虚拟机"{% endif %}>VNC</button>{% endif %}</div>
     <p class="sync-note">*请重置SSH密码，查收邮件</p>
   </article>{% endfor %}</div>{% else %}<div class="empty">暂无已交付主机，支付完成后系统会自动创建并启动鸡鸡。</div>{% endif %}
   {% set pending = orders|selectattr('status','in',['pending','paid','provisioning'])|list %}{% if pending %}<section class="pending-orders"><div class="section-head compact"><div><span class="eyebrow">处理中</span><h2>待交付订单</h2></div></div><div class="order-list">{% for order in pending %}<div class="order-row"><strong>{{ order.order_no }}</strong><span class="pill">{{ order.status }}</span>{% if jobs.get(order.id) and jobs[order.id].error %}<small>{{ jobs[order.id].error }}</small>{% endif %}</div>{% endfor %}</div></section>{% endif %}
 </div></main>
+<dialog id="vnc-dialog" class="vnc-dialog" aria-labelledby="vnc-title">
+  <div class="vnc-shell">
+    <header class="vnc-toolbar"><div><strong id="vnc-title">WebVNC</strong><span id="vnc-status" class="vnc-status">连接中</span></div><div class="vnc-controls"><button id="vnc-cad" type="button">Ctrl+Alt+Del</button><button id="vnc-reconnect" type="button">重新连接</button><button id="vnc-close" type="button" aria-label="关闭 VNC">×</button></div></header>
+    <div class="vnc-stage"><div id="vnc-screen" class="vnc-screen"></div><div id="vnc-message" class="vnc-message" hidden></div></div>
+  </div>
+</dialog>
+<script type="module">
+const dialog = document.getElementById("vnc-dialog");
+const screen = document.getElementById("vnc-screen");
+const title = document.getElementById("vnc-title");
+const status = document.getElementById("vnc-status");
+const message = document.getElementById("vnc-message");
+const reconnect = document.getElementById("vnc-reconnect");
+const sendCad = document.getElementById("vnc-cad");
+let activeButton = null;
+let rfb = null;
+let RFB = null;
+
+function setStatus(value, detail = "") {
+  status.textContent = value;
+  status.dataset.state = value;
+  message.textContent = detail;
+  message.hidden = !detail;
+}
+
+function disconnect() {
+  if (rfb) {
+    try { rfb.disconnect(); } catch (_) {}
+    rfb = null;
+  }
+  screen.replaceChildren();
+}
+
+async function connectVNC(button) {
+  activeButton = button;
+  disconnect();
+  title.textContent = `WebVNC · ${button.dataset.instanceName}`;
+  setStatus("连接中");
+  if (!dialog.open) dialog.showModal();
+  try {
+    if (!RFB) {
+      const module = await import("/static/vendor/novnc/core/rfb.js");
+      RFB = module.default;
+    }
+    const body = new URLSearchParams({ csrf: button.dataset.csrf });
+    const response = await fetch(button.dataset.sessionUrl, { method: "POST", body, headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" } });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || "WebVNC 会话创建失败");
+    const websocketUrl = new URL(payload.websocket_url, window.location.href);
+    websocketUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    rfb = new RFB(screen, websocketUrl.toString(), { wsProtocols: ["binary"] });
+    rfb.scaleViewport = true;
+    rfb.resizeSession = false;
+    rfb.focusOnClick = true;
+    rfb.qualityLevel = 6;
+    rfb.compressionLevel = 2;
+    rfb.background = "#050505";
+    rfb.addEventListener("connect", () => setStatus("已连接"));
+    rfb.addEventListener("disconnect", (event) => {
+      if (event.detail?.clean) setStatus("已断开");
+      else setStatus("连接失败", "WebVNC 连接已断开，请确认虚拟机正在运行且控制台可用");
+    });
+    rfb.addEventListener("securityfailure", () => setStatus("连接失败", "VNC 安全协商失败"));
+    rfb.addEventListener("credentialsrequired", () => setStatus("连接失败", "VNC 控制台要求额外密码"));
+  } catch (error) {
+    setStatus("连接失败", error instanceof Error ? error.message : "WebVNC 初始化失败");
+  }
+}
+
+document.querySelectorAll(".vnc-launch").forEach((button) => button.addEventListener("click", () => connectVNC(button)));
+reconnect.addEventListener("click", () => activeButton && connectVNC(activeButton));
+sendCad.addEventListener("click", () => rfb?.sendCtrlAltDel());
+document.getElementById("vnc-close").addEventListener("click", () => dialog.close());
+dialog.addEventListener("close", disconnect);
+dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
+</script>
 </body>
 </html>

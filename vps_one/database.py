@@ -27,7 +27,7 @@ def pragmas(conn, _):
 MIGRATIONS = {
     "users": {"is_active": "BOOLEAN NOT NULL DEFAULT 1", "last_login_at": "DATETIME"},
     "plans": {
-        "slug": "VARCHAR(100)", "features_json": "TEXT NOT NULL DEFAULT '[]'", "stock": "INTEGER NOT NULL DEFAULT -1", "sort_order": "INTEGER NOT NULL DEFAULT 0", "virtualization": "VARCHAR(16) NOT NULL DEFAULT 'lxc'", "network_down_mbps": "INTEGER NOT NULL DEFAULT 100", "network_up_mbps": "INTEGER NOT NULL DEFAULT 50", "io_read_mbps": "INTEGER NOT NULL DEFAULT 0", "io_write_mbps": "INTEGER NOT NULL DEFAULT 0", "assign_nat": "BOOLEAN NOT NULL DEFAULT 1", "port_mapping_count": "INTEGER NOT NULL DEFAULT 1", "assign_ipv4": "BOOLEAN NOT NULL DEFAULT 0", "ipv4_count": "INTEGER NOT NULL DEFAULT 0", "assign_ipv6": "BOOLEAN NOT NULL DEFAULT 1", "ipv6_count": "INTEGER NOT NULL DEFAULT 1", "clicd_node": "VARCHAR(500) NOT NULL DEFAULT ''", "clicd_template_name": "VARCHAR(200) NOT NULL DEFAULT ''", "clicd_validated_at": "DATETIME", "created_at": "DATETIME"
+        "slug": "VARCHAR(100)", "features_json": "TEXT NOT NULL DEFAULT '[]'", "stock": "INTEGER NOT NULL DEFAULT -1", "sort_order": "INTEGER NOT NULL DEFAULT 0", "virtualization": "VARCHAR(16) NOT NULL DEFAULT 'lxc'", "network_down_mbps": "INTEGER NOT NULL DEFAULT 100", "network_up_mbps": "INTEGER NOT NULL DEFAULT 50", "io_read_mbps": "INTEGER NOT NULL DEFAULT 0", "io_write_mbps": "INTEGER NOT NULL DEFAULT 0", "assign_nat": "BOOLEAN NOT NULL DEFAULT 1", "port_mapping_count": "INTEGER NOT NULL DEFAULT 2", "assign_ipv4": "BOOLEAN NOT NULL DEFAULT 0", "ipv4_count": "INTEGER NOT NULL DEFAULT 0", "assign_ipv6": "BOOLEAN NOT NULL DEFAULT 1", "ipv6_count": "INTEGER NOT NULL DEFAULT 1", "clicd_node": "VARCHAR(500) NOT NULL DEFAULT ''", "clicd_template_name": "VARCHAR(200) NOT NULL DEFAULT ''", "clicd_validated_at": "DATETIME", "created_at": "DATETIME"
     },
     "orders": {"plan_snapshot": "TEXT NOT NULL DEFAULT '{}'", "fulfilled_at": "DATETIME"},
     "instances": {"clicd_node": "VARCHAR(500) NOT NULL DEFAULT ''", "ipv6": "VARCHAR(100) NOT NULL DEFAULT ''", "management_url": "TEXT NOT NULL DEFAULT ''", "ssh_password": "TEXT NOT NULL DEFAULT ''", "access_json": "TEXT NOT NULL DEFAULT '{}'", "last_synced_at": "DATETIME"},
@@ -87,6 +87,15 @@ async def migrate_instance_identity(conn):
     await conn.execute(text("ALTER TABLE instances_multi_node RENAME TO instances"))
 
 
+async def normalize_plan_nat_port_counts(conn):
+    columns = {row[1] for row in await conn.execute(text("PRAGMA table_info(plans)"))}
+    if not {"assign_nat", "port_mapping_count"}.issubset(columns):
+        return
+    await conn.execute(text("UPDATE plans SET port_mapping_count = 0 WHERE assign_nat = 0 AND port_mapping_count != 0"))
+    await conn.execute(text("UPDATE plans SET port_mapping_count = 2 WHERE assign_nat = 1 AND port_mapping_count < 2"))
+    await conn.execute(text("UPDATE plans SET port_mapping_count = 64 WHERE assign_nat = 1 AND port_mapping_count > 64"))
+
+
 async def migrate(conn):
     for table, columns in MIGRATIONS.items():
         rows = await conn.execute(text(f"PRAGMA table_info({table})"))
@@ -97,6 +106,7 @@ async def migrate(conn):
             if name not in existing:
                 await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
     await migrate_instance_identity(conn)
+    await normalize_plan_nat_port_counts(conn)
     await conn.execute(text("UPDATE plans SET slug = 'plan-' || id WHERE slug IS NULL OR slug = ''"))
     await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_plans_slug ON plans(slug)"))
     await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_user_status ON orders(user_id,status)"))

@@ -8,9 +8,9 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from vps_one.database import migrate_instance_identity
-from vps_one.main import app, containers_by_node, decode_clicd_ref, encode_clicd_ref, encrypted_access, instance_access, instance_card, instance_mail_text, node_for_instance, node_from_ref, parse_clicd_nodes, parse_plan_image_choice, plan_image_choice
-from vps_one.models import Instance, Setting
+from vps_one.database import migrate_instance_identity, normalize_plan_nat_port_counts
+from vps_one.main import app, consume_vnc_session, containers_by_node, create_vnc_session, decode_clicd_ref, encode_clicd_ref, encrypted_access, instance_access, instance_card, instance_mail_text, node_for_instance, node_from_ref, parse_clicd_nodes, parse_plan_image_choice, plan_image_choice
+from vps_one.models import Instance, Order, Plan, Setting
 from vps_one.security import decrypt, encrypt, hash_password, verify_password
 from datetime import datetime, timezone
 from vps_one.services.clicd import CLICD, CLICDError, container_details, container_items, container_status, enabled_image_items, expiration_date, extract_access, normalize_virtualization, plan_payload, reset_password_value
@@ -149,6 +149,8 @@ def test_clicd_action_routes_do_not_shadow_specialized_routes():
     assert "/instances/{instance_id}/actions/{action}" in paths
     assert "/instances/{instance_id}/snapshot" in paths
     assert "/instances/{instance_id}/port" in paths
+    assert "/instances/{instance_id}/vnc-session" in paths
+    assert "/instances/{instance_id}/vnc" in paths
     assert "/admin/products/{container_ref}/actions/{action}" in paths
     assert "/admin/products/{container_ref}/limits" in paths
     assert "/admin/products/{container_ref}/delete" in paths
@@ -177,11 +179,59 @@ async def test_legacy_instance_unique_id_migration():
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_plan_nat_port_count_migration():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE plans (id INTEGER PRIMARY KEY, assign_nat BOOLEAN NOT NULL, port_mapping_count INTEGER NOT NULL)"))
+        await conn.execute(text("INSERT INTO plans VALUES (1,1,1),(2,0,12),(3,1,80),(4,1,8)"))
+        await normalize_plan_nat_port_counts(conn)
+        rows = (await conn.execute(text("SELECT assign_nat,port_mapping_count FROM plans ORDER BY id"))).all()
+        assert rows == [(1, 2), (0, 0), (1, 64), (1, 8)]
+    await engine.dispose()
+
+
 def test_real_clicd_container_contract():
     response = {"success": True, "data": [{"id": 27, "uuid": "d25b9ba6", "name": "KVM-S-1", "ip": "192.168.122.85", "public_ipv4s": [{"address": "192.151.158.3"}], "ipv6": "2001:db8::1", "ssh_port": 0, "ssh_password": "secret", "status": "running", "template": "kvm-debian-bookworm"}]}
     item = container_items(response)[0]
     details = container_details(item)
-    assert details == {"id": "d25b9ba6", "name": "KVM-S-1", "status": "running", "ip": "192.151.158.3", "ipv6": "2001:db8::1", "ssh_port": 22, "ssh_password": "secret", "operating_system": "kvm-debian-bookworm"}
+    assert details == {"id": "d25b9ba6", "name": "KVM-S-1", "virtualization": "kvm", "status": "running", "ip": "192.151.158.3", "ipv6": "2001:db8::1", "ssh_port": 22, "ssh_password": "secret", "operating_system": "kvm-debian-bookworm"}
+
+
+def test_instance_card_marks_only_kvm_for_vnc():
+    instance = Instance(user_id=1, order_id=1, plan_id=1, name="VPS-1", status="running", clicd_id="vm-1")
+    order = Order(order_no="VP1", user_id=1, plan_id=1, amount_cents=100, currency="CNY", plan_snapshot=json.dumps({"name": "KVM", "virtualization": "kvm"}))
+    plan = Plan(id=1, name="KVM", slug="kvm", price_cents=100, cpu=1, memory_mb=512, disk_gb=10, virtualization="kvm")
+    card = instance_card(instance, order, plan, {"id": "vm-1", "name": "kvm-one", "status": "running", "virtualization": "kvm", "template": "debian"})
+    assert card["virtualization"] == "kvm"
+    assert card["is_kvm"] is True
+    lxc_card = instance_card(instance, order, plan, {"id": "vm-1", "name": "lxc-one", "status": "running", "virtualization": "lxc", "template": "debian"})
+    assert lxc_card["is_kvm"] is False
+
+
+def test_vnc_session_is_one_time_and_bound_to_instance():
+    token = create_vnc_session(7, 9, "https://panel.example.com", "kvm-one", "ticket-one")
+    assert consume_vnc_session(token, 7, 8) is None
+    token = create_vnc_session(7, 9, "https://panel.example.com", "kvm-one", "ticket-two")
+    session = consume_vnc_session(token, 7, 9)
+    assert session and session.clicd_ticket == "ticket-two"
+    assert consume_vnc_session(token, 7, 9) is None
+
+
+@pytest.mark.asyncio
+async def test_clicd_webvnc_contract(monkeypatch):
+    calls = []
+
+    async def request(self, method, path, data=None, params=None):
+        calls.append((method, path, data))
+        return {"success": True, "data": {"ticket": "ticket-123"}}
+
+    monkeypatch.setattr(CLICD, "request", request)
+    client = CLICD("https://panel.example.com/panel/", "token")
+    assert await client.vnc_ticket("KVM S/1") == "ticket-123"
+    assert calls == [("POST", "/vnc-ticket", {"container_name": "KVM S/1"})]
+    assert client.vnc_websocket_url("KVM S/1") == "wss://panel.example.com/panel/api/vnc?container=KVM+S%2F1"
+    assert client.headers["User-Agent"] == "VPS-ONE/1.0"
 
 
 def test_reset_password_contract():
@@ -218,11 +268,16 @@ def test_clicd_payload_contract():
     assert payload["vcpu"] == 2
     assert payload["template_id"] == "debian-bookworm"
     assert payload["assign_nat"] is True
+    assert payload["port_mapping_count"] == 2
     assert payload["network_up_mbps"] == 100
     assert payload["ssh_password"] == ""
     assert payload["ssh_public_key"] == ""
     assert payload["expires_at"] == "2097-01-01"
     assert "monthly_traffic_gb" not in payload
+    Plan.port_mapping_count = 12
+    assert plan_payload(Plan(), "VP124", "2097-01-01")["port_mapping_count"] == 12
+    Plan.assign_nat = False
+    assert plan_payload(Plan(), "VP125", "2097-01-01")["port_mapping_count"] == 0
 
 
 def test_expiration_date_contract():
