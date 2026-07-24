@@ -1,6 +1,10 @@
 from datetime import date, datetime, timezone
 from typing import Any
+from urllib.parse import urlencode, urlparse, urlunparse
 import httpx
+
+
+CLICD_USER_AGENT = "VPS-ONE/1.0"
 
 
 class CLICDError(RuntimeError):
@@ -131,6 +135,8 @@ def container_details(result: Any) -> dict[str, Any]:
     value = unwrap_data(result)
     if not isinstance(value, dict):
         return {}
+    operating_system = str(value.get("template_name") or value.get("template") or value.get("image_name") or value.get("image") or "")
+    virtualization = normalize_virtualization(value.get("virtualization") or value.get("type")) or normalize_virtualization(operating_system.split("-", 1)[0])
     public = value.get("public_ipv4s") or value.get("public_ips") or []
     public_ip = ""
     if isinstance(public, list) and public:
@@ -141,12 +147,13 @@ def container_details(result: Any) -> dict[str, Any]:
     return {
         "id": str(value.get("uuid") or value.get("id") or value.get("container_id") or ""),
         "name": str(value.get("name") or value.get("container_name") or ""),
+        "virtualization": virtualization,
         "status": container_status(value),
         "ip": public_ip or str(value.get("public_ip") or value.get("public_ipv4") or value.get("ip") or ""),
         "ipv6": str(value.get("ipv6") or value.get("ipv6_address") or ""),
         "ssh_port": int(value.get("ssh_port") or 22),
         "ssh_password": str(value.get("ssh_password") or value.get("password") or ""),
-        "operating_system": str(value.get("template_name") or value.get("template") or value.get("image_name") or value.get("image") or ""),
+        "operating_system": operating_system,
     }
 
 
@@ -178,7 +185,7 @@ class CLICD:
         if not base_url or not token:
             raise CLICDError("CLICD 尚未配置")
         self.base = base_url.rstrip("/")
-        self.headers = {"X-API-Key": token, "Content-Type": "application/json", "Accept": "application/json"}
+        self.headers = {"X-API-Key": token, "Content-Type": "application/json", "Accept": "application/json", "User-Agent": CLICD_USER_AGENT}
         self.timeout = httpx.Timeout(connect=5, read=30, write=15, pool=5)
 
     async def request(self, method: str, path: str, data: dict[str, Any] | None = None, params: dict[str, Any] | None = None):
@@ -321,8 +328,23 @@ class CLICD:
     async def ssh_ticket(self, instance_id: str):
         return await self.request("POST", "/ssh-ticket", {"container_id": instance_id})
 
+    async def vnc_ticket(self, container_name: str) -> str:
+        result = unwrap_data(await self.request("POST", "/vnc-ticket", {"container_name": container_name}))
+        ticket = str(result.get("ticket") or "") if isinstance(result, dict) else ""
+        if not ticket:
+            raise CLICDError("CLICD 未返回 WebVNC 票据")
+        return ticket
+
+    def vnc_websocket_url(self, container_name: str) -> str:
+        parsed = urlparse(self.base)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        path = parsed.path.rstrip("/") + "/api/vnc"
+        return urlunparse((scheme, parsed.netloc, path, "", urlencode({"container": container_name}), ""))
+
 
 def plan_payload(plan, order_no: str, expires_at: date | datetime | str) -> dict[str, Any]:
+    assign_nat = bool(plan.assign_nat)
+    port_mapping_count = max(2, min(64, int(plan.port_mapping_count or 2))) if assign_nat else 0
     return {
         "name": f"vps-{order_no.lower()}",
         "virtualization": plan.virtualization,
@@ -330,8 +352,8 @@ def plan_payload(plan, order_no: str, expires_at: date | datetime | str) -> dict
         "vcpu": plan.cpu,
         "ram_mb": plan.memory_mb,
         "disk_gb": plan.disk_gb,
-        "assign_nat": plan.assign_nat,
-        "port_mapping_count": plan.port_mapping_count,
+        "assign_nat": assign_nat,
+        "port_mapping_count": port_mapping_count,
         "assign_ipv4": plan.assign_ipv4,
         "ipv4_count": plan.ipv4_count,
         "public_ipv4s": [],
