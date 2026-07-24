@@ -1,0 +1,38 @@
+version: '3.8'
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - CLICD_BASE=${CLICD_BASE}
+      - CLICD_API_KEY=${CLICD_API_KEY}
+      - SMTP_HOST=smtp
+      - SMTP_PORT=25
+      - SMTP_USER=
+      - SMTP_PASS=
+    depends_on:
+      - smtp
+      - hashpay-mock
+    tty: true
+
+  hashpay-mock:
+    build: ./tools/hashpay-mock
+    ports:
+      - "8081:8081"
+    environment:
+      - PORT=8081
+
+  smtp:
+    image: rnwood/smtp4dev:latest
+    restart: unless-stopped
+    ports:
+      - "5025:5025" # smtp port
+      - "5000:80"   # web UI
+    volumes:
+      - smtp4dev-data:/data
+
+volumes:
+  smtp4dev-data:
