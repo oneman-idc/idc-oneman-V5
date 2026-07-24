@@ -323,6 +323,8 @@ class CLICD:
 
 
 def plan_payload(plan, order_no: str, expires_at: date | datetime | str) -> dict[str, Any]:
+    assign_nat = bool(plan.assign_nat)
+    port_mapping_count = max(2, min(64, int(plan.port_mapping_count or 2))) if assign_nat else 0
     return {
         "name": f"vps-{order_no.lower()}",
         "virtualization": plan.virtualization,
@@ -330,8 +332,8 @@ def plan_payload(plan, order_no: str, expires_at: date | datetime | str) -> dict
         "vcpu": plan.cpu,
         "ram_mb": plan.memory_mb,
         "disk_gb": plan.disk_gb,
-        "assign_nat": plan.assign_nat,
-        "port_mapping_count": plan.port_mapping_count,
+        "assign_nat": assign_nat,
+        "port_mapping_count": port_mapping_count,
         "assign_ipv4": plan.assign_ipv4,
         "ipv4_count": plan.ipv4_count,
         "public_ipv4s": [],

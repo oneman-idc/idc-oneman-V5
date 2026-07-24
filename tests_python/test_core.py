@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from vps_one.database import migrate_instance_identity
+from vps_one.database import migrate_instance_identity, normalize_plan_nat_port_counts
 from vps_one.main import app, containers_by_node, decode_clicd_ref, encode_clicd_ref, encrypted_access, instance_access, instance_card, instance_mail_text, node_for_instance, node_from_ref, parse_clicd_nodes, parse_plan_image_choice, plan_image_choice
 from vps_one.models import Instance, Setting
 from vps_one.security import decrypt, encrypt, hash_password, verify_password
@@ -177,6 +177,18 @@ async def test_legacy_instance_unique_id_migration():
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_plan_nat_port_count_migration():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE plans (id INTEGER PRIMARY KEY, assign_nat BOOLEAN NOT NULL, port_mapping_count INTEGER NOT NULL)"))
+        await conn.execute(text("INSERT INTO plans VALUES (1,1,1),(2,0,12),(3,1,80),(4,1,8)"))
+        await normalize_plan_nat_port_counts(conn)
+        rows = (await conn.execute(text("SELECT assign_nat,port_mapping_count FROM plans ORDER BY id"))).all()
+        assert rows == [(1, 2), (0, 0), (1, 64), (1, 8)]
+    await engine.dispose()
+
+
 def test_real_clicd_container_contract():
     response = {"success": True, "data": [{"id": 27, "uuid": "d25b9ba6", "name": "KVM-S-1", "ip": "192.168.122.85", "public_ipv4s": [{"address": "192.151.158.3"}], "ipv6": "2001:db8::1", "ssh_port": 0, "ssh_password": "secret", "status": "running", "template": "kvm-debian-bookworm"}]}
     item = container_items(response)[0]
@@ -218,11 +230,16 @@ def test_clicd_payload_contract():
     assert payload["vcpu"] == 2
     assert payload["template_id"] == "debian-bookworm"
     assert payload["assign_nat"] is True
+    assert payload["port_mapping_count"] == 2
     assert payload["network_up_mbps"] == 100
     assert payload["ssh_password"] == ""
     assert payload["ssh_public_key"] == ""
     assert payload["expires_at"] == "2097-01-01"
     assert "monthly_traffic_gb" not in payload
+    Plan.port_mapping_count = 12
+    assert plan_payload(Plan(), "VP124", "2097-01-01")["port_mapping_count"] == 12
+    Plan.assign_nat = False
+    assert plan_payload(Plan(), "VP125", "2097-01-01")["port_mapping_count"] == 0
 
 
 def test_expiration_date_contract():

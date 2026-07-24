@@ -212,7 +212,7 @@ def unwrap(result):
 
 
 def plan_snapshot(plan: Plan) -> str:
-    fields = ["name", "description", "price_cents", "currency", "months", "cpu", "memory_mb", "disk_gb", "traffic_gb", "network_down_mbps", "network_up_mbps", "virtualization", "clicd_node", "clicd_image"]
+    fields = ["name", "description", "price_cents", "currency", "months", "cpu", "memory_mb", "disk_gb", "traffic_gb", "network_down_mbps", "network_up_mbps", "virtualization", "clicd_node", "clicd_image", "assign_nat", "port_mapping_count"]
     return json.dumps({field: getattr(plan, field) for field in fields}, ensure_ascii=False)
 
 
@@ -249,7 +249,7 @@ def snapshot_data(order: Order, plan: Plan) -> dict:
         value = json.loads(order.plan_snapshot or "{}")
     except (TypeError, ValueError):
         value = {}
-    return value if isinstance(value, dict) and value else {field: getattr(plan, field, "") for field in ("name", "cpu", "memory_mb", "disk_gb", "traffic_gb", "network_down_mbps", "network_up_mbps", "clicd_image")}
+    return value if isinstance(value, dict) and value else {field: getattr(plan, field, "") for field in ("name", "cpu", "memory_mb", "disk_gb", "traffic_gb", "network_down_mbps", "network_up_mbps", "clicd_image", "assign_nat", "port_mapping_count")}
 
 
 def instance_card(instance: Instance, order: Order, plan: Plan, remote: dict | None = None) -> dict:
@@ -846,11 +846,14 @@ async def admin_plans(request: Request, db=Depends(session)):
 
 
 @app.post("/admin/plans")
-async def save_plan(request: Request, csrf: str = Form(), plan_id: int = Form(0), name: str = Form(), slug: str = Form(), description: str = Form(""), price_cents: int = Form(), months: int = Form(1), stock: int = Form(-1), cpu: int = Form(), memory_mb: int = Form(), disk_gb: int = Form(), traffic_gb: int = Form(), network_down_mbps: int = Form(), network_up_mbps: int = Form(), virtualization: str = Form("lxc"), clicd_image: str = Form(), assign_nat: bool = Form(False), assign_ipv4: bool = Form(False), assign_ipv6: bool = Form(False), active: bool = Form(False), db=Depends(session)):
+async def save_plan(request: Request, csrf: str = Form(), plan_id: int = Form(0), name: str = Form(), slug: str = Form(), description: str = Form(""), price_cents: int = Form(), months: int = Form(1), stock: int = Form(-1), cpu: int = Form(), memory_mb: int = Form(), disk_gb: int = Form(), traffic_gb: int = Form(), network_down_mbps: int = Form(), network_up_mbps: int = Form(), virtualization: str = Form("lxc"), clicd_image: str = Form(), assign_nat: bool = Form(False), port_mapping_count: int = Form(2), assign_ipv4: bool = Form(False), assign_ipv6: bool = Form(False), active: bool = Form(False), db=Depends(session)):
     user = guard(request, True)
     check_csrf(request, csrf)
     if virtualization not in {"lxc", "kvm"} or min(price_cents, months, cpu, memory_mb, disk_gb) < 1:
         raise HTTPException(400, "套餐字段无效")
+    if assign_nat and not 2 <= port_mapping_count <= 64:
+        raise HTTPException(400, "NAT 端口数量必须在 2 到 64 之间")
+    nat_port_count = port_mapping_count if assign_nat else 0
     selected_node, image_id = parse_plan_image_choice(clicd_image)
     node = find_clicd_node(await clicd_nodes(db), selected_node)
     client = node.client()
@@ -859,7 +862,7 @@ async def save_plan(request: Request, csrf: str = Form(), plan_id: int = Form(0)
     if not matched:
         raise HTTPException(400, f"{node.label} 中未找到已启用且已下载的 {virtualization.upper()} 镜像：{image_id}")
     plan = await db.get(Plan, plan_id) if plan_id else Plan(name=name, slug=slug, price_cents=price_cents, cpu=cpu, memory_mb=memory_mb, disk_gb=disk_gb)
-    for key, value in {"name": name, "slug": slug, "description": description, "price_cents": price_cents, "months": months, "stock": stock, "cpu": cpu, "memory_mb": memory_mb, "disk_gb": disk_gb, "traffic_gb": traffic_gb, "network_down_mbps": network_down_mbps, "network_up_mbps": network_up_mbps, "virtualization": virtualization, "clicd_node": node.base_url, "clicd_image": image_id, "clicd_template_name": str(matched.get("name") or matched.get("label") or image_id), "clicd_validated_at": datetime.utcnow(), "assign_nat": assign_nat, "assign_ipv4": assign_ipv4, "assign_ipv6": assign_ipv6, "active": active}.items():
+    for key, value in {"name": name, "slug": slug, "description": description, "price_cents": price_cents, "months": months, "stock": stock, "cpu": cpu, "memory_mb": memory_mb, "disk_gb": disk_gb, "traffic_gb": traffic_gb, "network_down_mbps": network_down_mbps, "network_up_mbps": network_up_mbps, "virtualization": virtualization, "clicd_node": node.base_url, "clicd_image": image_id, "clicd_template_name": str(matched.get("name") or matched.get("label") or image_id), "clicd_validated_at": datetime.utcnow(), "assign_nat": assign_nat, "port_mapping_count": nat_port_count, "assign_ipv4": assign_ipv4, "assign_ipv6": assign_ipv6, "active": active}.items():
         setattr(plan, key, value)
     db.add(plan)
     db.add(Audit(user_id=user["uid"], action="plan.save", detail=slug))
