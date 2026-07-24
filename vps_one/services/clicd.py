@@ -94,6 +94,39 @@ def container_items(result: Any) -> list[dict[str, Any]]:
     return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
 
+def normalize_virtualization(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"lxc", "kvm"} else ""
+
+
+def enabled_image_items(result: Any, requested_type: str) -> list[dict[str, Any]]:
+    """Normalize CLICD enabled-image responses and preserve the requested runtime."""
+    data = result
+    for _ in range(5):
+        if isinstance(data, list):
+            break
+        if not isinstance(data, dict):
+            return []
+        nested = next((data[key] for key in ("data", "items", "images", "result", "templates") if key in data and data[key] is not None), None)
+        if nested is None:
+            return []
+        data = nested
+    if not isinstance(data, list):
+        return []
+    images: list[dict[str, Any]] = []
+    for image in data:
+        if not isinstance(image, dict):
+            continue
+        image_id = image.get("id") or image.get("template_id") or image.get("slug")
+        if image_id is None or image_id == "":
+            continue
+        image_type = normalize_virtualization(image.get("type") or image.get("virtualization")) or requested_type
+        if image_type != requested_type:
+            continue
+        images.append({**image, "id": str(image_id), "type": image_type})
+    return images
+
+
 def container_details(result: Any) -> dict[str, Any]:
     value = unwrap_data(result)
     if not isinstance(value, dict):
@@ -191,27 +224,29 @@ class CLICD:
         return reset_password_value(await self.request("POST", f"/containers/{instance_id}/reset-password", {"password": password}))
 
     async def templates(self, virtualization: str = ""):
-        host = unwrap_data(await self.host_info())
-        requested_types = [virtualization] if virtualization else ["lxc", "kvm"]
-        available_types = [
-            image_type
-            for image_type in requested_types
-            if isinstance(host, dict) and host.get(f"{image_type}_available") is True
-        ]
-        if not available_types:
-            return {"data": []}
-            
+        selected_type = normalize_virtualization(virtualization)
+        if virtualization and not selected_type:
+            raise CLICDError("CLICD 镜像类型必须是 LXC 或 KVM")
+        requested_types = [selected_type] if selected_type else ["lxc", "kvm"]
         images: list[dict[str, Any]] = []
-        for image_type in available_types:
-            response = await self.request("GET", "/images/enabled", params={"type": image_type})
-            enabled = response.get("data", response) if isinstance(response, dict) else response
-            if isinstance(enabled, dict):
-                enabled = enabled.get("items") or enabled.get("images") or []
-            if isinstance(enabled, list):
-                for image in enabled:
-                    if isinstance(image, dict):
-                        images.append({**image, "type": image.get("type") or image_type})
-        return {"data": images}
+        errors: list[str] = []
+        succeeded = 0
+        seen: set[tuple[str, str]] = set()
+        for image_type in requested_types:
+            try:
+                response = await self.request("GET", "/images/enabled", params={"type": image_type})
+            except CLICDError as exc:
+                errors.append(f"{image_type.upper()}: {exc}")
+                continue
+            succeeded += 1
+            for image in enabled_image_items(response, image_type):
+                key = (image["type"], image["id"])
+                if key not in seen:
+                    seen.add(key)
+                    images.append(image)
+        if not succeeded and errors:
+            raise CLICDError("；".join(errors))
+        return {"data": images, "errors": errors}
 
     async def host_info(self):
         return await self.request("GET", "/host-info")
@@ -267,7 +302,7 @@ class CLICD:
     async def action(self, instance_id: str, action: str, data: dict[str, Any] | None = None):
         allowed = {"start", "stop", "restart", "reset-password", "reinstall"}
         if action not in allowed:
-            raise CLICDError("不允许的���例操作")
+            raise CLICDError("不允许的实例操作")
         return await self.request("POST", f"/containers/{instance_id}/{action}", data or {})
 
     async def snapshots(self, instance_id: str):

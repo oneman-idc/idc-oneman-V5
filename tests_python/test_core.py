@@ -13,7 +13,7 @@ from vps_one.main import app, containers_by_node, decode_clicd_ref, encode_clicd
 from vps_one.models import Instance, Setting
 from vps_one.security import decrypt, encrypt, hash_password, verify_password
 from datetime import datetime, timezone
-from vps_one.services.clicd import CLICD, CLICDError, container_details, container_items, container_status, expiration_date, extract_access, plan_payload, reset_password_value
+from vps_one.services.clicd import CLICD, CLICDError, container_details, container_items, container_status, enabled_image_items, expiration_date, extract_access, normalize_virtualization, plan_payload, reset_password_value
 from vps_one.services.hashpay import HashPay
 
 
@@ -39,6 +39,58 @@ def test_clicd_status_and_sub_user_contract():
     assert container_status(response["data"]["container"]) == "running"
     assert container_status({"data": {"power_status": "offline"}}) == "stopped"
     assert extract_access(response) == {"username": "user-d7db054c", "password": "temporary-secret", "access_code": "a877d569", "management_url": "http://192.0.2.10:8999/login?code=a877d569"}
+
+
+def test_enabled_image_response_normalization():
+    response = {"success": True, "data": {"items": [{"template_id": "debian-bookworm", "name": "Debian"}, {"id": "wrong-runtime", "type": "kvm"}, {"name": "missing-id"}]}}
+    assert enabled_image_items(response, "lxc") == [{"template_id": "debian-bookworm", "name": "Debian", "id": "debian-bookworm", "type": "lxc"}]
+    assert normalize_virtualization(" KVM ") == "kvm"
+    assert normalize_virtualization("docker") == ""
+
+
+@pytest.mark.asyncio
+async def test_clicd_templates_query_enabled_images_by_runtime(monkeypatch):
+    calls = []
+
+    async def request(self, method, path, data=None, params=None):
+        calls.append((method, path, params))
+        if params["type"] == "lxc":
+            return {"success": True, "data": [{"id": "lxc-debian", "name": "Debian LXC", "type": "lxc"}]}
+        return {"success": True, "data": {"images": [{"slug": "kvm-debian", "name": "Debian KVM"}]}}
+
+    async def host_info(self):
+        raise AssertionError("templates() must not use host-info runtime fields")
+
+    monkeypatch.setattr(CLICD, "request", request)
+    monkeypatch.setattr(CLICD, "host_info", host_info)
+    client = CLICD("https://panel.example.com", "token")
+    result = await client.templates()
+    assert result["data"] == [
+        {"id": "lxc-debian", "name": "Debian LXC", "type": "lxc"},
+        {"slug": "kvm-debian", "name": "Debian KVM", "id": "kvm-debian", "type": "kvm"},
+    ]
+    assert calls == [("GET", "/images/enabled", {"type": "lxc"}), ("GET", "/images/enabled", {"type": "kvm"})]
+    calls.clear()
+    assert (await client.templates("kvm"))["data"][0]["id"] == "kvm-debian"
+    assert calls == [("GET", "/images/enabled", {"type": "kvm"})]
+    with pytest.raises(CLICDError, match="LXC 或 KVM"):
+        await client.templates("docker")
+
+
+@pytest.mark.asyncio
+async def test_clicd_templates_keep_partial_runtime_results(monkeypatch):
+    async def request(self, method, path, data=None, params=None):
+        if params["type"] == "kvm":
+            raise CLICDError("KVM endpoint unavailable")
+        return {"data": [{"id": "lxc-debian", "name": "Debian"}]}
+
+    monkeypatch.setattr(CLICD, "request", request)
+    client = CLICD("https://panel.example.com", "token")
+    result = await client.templates()
+    assert [image["id"] for image in result["data"]] == ["lxc-debian"]
+    assert result["errors"] == ["KVM: KVM endpoint unavailable"]
+    with pytest.raises(CLICDError, match="KVM endpoint unavailable"):
+        await client.templates("kvm")
 
 
 def test_multi_clicd_configuration_and_references():

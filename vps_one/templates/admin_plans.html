@@ -33,8 +33,8 @@
             <label class="field">月流量 GB<input type="number" name="traffic_gb" min="0" value="0"></label>
             <label class="field">下行 Mbps<input type="number" name="network_down_mbps" min="0" value="100"></label>
             <label class="field">上行 Mbps<input type="number" name="network_up_mbps" min="0" value="50"></label>
-            <label class="field">虚拟化<select name="virtualization"><option value="lxc">LXC</option><option value="kvm">KVM</option></select></label>
-            <label class="field wide">CLICD 节点与镜像<select name="clicd_image" required><option value="">请选择节点与镜像</option>{% for image in templates_list %}<option value="{{image._clicd_choice}}">{{image._clicd_node_label}} · {{image.name or image.label or image.id}} · {{image.type or image.virtualization or 'LXC'}}</option>{% endfor %}</select></label>
+            <label class="field">虚拟化<select id="plan-virtualization" name="virtualization"><option value="lxc">LXC</option><option value="kvm">KVM</option></select></label>
+            <label class="field wide">CLICD 节点与镜像<select id="plan-clicd-image" name="clicd_image" required><option value="">请选择 LXC 节点与镜像</option>{% for image in templates_list %}<option value="{{image._clicd_choice}}" data-virtualization="{{image.type}}">{{image._clicd_node_label}} · {{image.name or image.label or image.id}} · {{image.type|upper}}</option>{% endfor %}</select></label>
             {% if error %}<div class="notice danger wide">{{error}}，请先完成系统配置。</div>{% endif %}
           </div>
           <div class="checks"><label><input type="checkbox" name="assign_nat" checked> NAT</label><label><input type="checkbox" name="assign_ipv6" checked> IPv6</label><label><input type="checkbox" name="assign_ipv4"> 公网 IPv4</label><label><input type="checkbox" name="active" checked> 上架</label></div>
@@ -56,5 +56,28 @@
     </div>
   </main>
 </div>
+<script>
+(() => {
+  const virtualization = document.getElementById("plan-virtualization");
+  const images = document.getElementById("plan-clicd-image");
+  if (!virtualization || !images) return;
+  const placeholder = images.options[0];
+  const syncImages = () => {
+    const selectedType = virtualization.value;
+    let available = 0;
+    for (const option of Array.from(images.options).slice(1)) {
+      const matches = option.dataset.virtualization === selectedType;
+      option.hidden = !matches;
+      option.disabled = !matches;
+      if (matches) available += 1;
+    }
+    if (images.selectedOptions[0]?.disabled) images.value = "";
+    const label = selectedType.toUpperCase();
+    placeholder.textContent = available ? `请选择 ${label} 节点与镜像` : `暂无可用的 ${label} 镜像`;
+  };
+  virtualization.addEventListener("change", syncImages);
+  syncImages();
+})();
+</script>
 </body>
 </html>

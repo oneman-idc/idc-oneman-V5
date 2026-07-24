@@ -23,7 +23,7 @@ from .config import settings
 from .database import SessionLocal, init_db, session, write_lock
 from .models import Audit, Instance, Job, Order, PaymentEvent, Plan, User
 from .security import csrf_token, decrypt, encrypt, hash_password, read_session, session_token, valid_csrf, verify_password
-from .services.clicd import CLICD, CLICDError, container_details, container_items, container_status, extract_access, plan_payload, unwrap_data
+from .services.clicd import CLICD, CLICDError, container_details, container_items, container_status, extract_access, normalize_virtualization, plan_payload, unwrap_data
 from .services.hashpay import HashPay
 from .services.mailer import send_mail
 from .services.settings import get, set_many
@@ -830,10 +830,15 @@ async def admin_plans(request: Request, db=Depends(session)):
             if isinstance(result, Exception):
                 errors.append(f"{node.label}: {result}")
                 continue
+            if isinstance(result, dict):
+                errors.extend(f"{node.label}: {warning}" for warning in result.get("errors", []) if warning)
             for image in unwrap(result) or []:
                 image_id = str(image.get("id") or image.get("template_id") or image.get("slug") or "")
-                if image_id:
-                    templates_list.append({**image, "_clicd_node": node.base_url, "_clicd_node_label": node.label, "_clicd_choice": plan_image_choice(node, image_id)})
+                image_type = normalize_virtualization(image.get("type") or image.get("virtualization"))
+                if image_id and image_type:
+                    templates_list.append({**image, "type": image_type, "_clicd_node": node.base_url, "_clicd_node_label": node.label, "_clicd_choice": plan_image_choice(node, image_id)})
+        if not templates_list and not errors:
+            errors.append("CLICD 未返回已启用且已下载的 LXC/KVM 镜像")
         error = "; ".join(errors)
     except Exception as exc:
         error = str(exc)
@@ -850,9 +855,9 @@ async def save_plan(request: Request, csrf: str = Form(), plan_id: int = Form(0)
     node = find_clicd_node(await clicd_nodes(db), selected_node)
     client = node.client()
     images = unwrap(await client.templates(virtualization)) or []
-    matched = next((item for item in images if str(item.get("id") or item.get("template_id") or item.get("slug")) == image_id), None)
+    matched = next((item for item in images if normalize_virtualization(item.get("type") or item.get("virtualization")) == virtualization and str(item.get("id") or item.get("template_id") or item.get("slug")) == image_id), None)
     if not matched:
-        raise HTTPException(400, "CLICD 中未找到已启用且已下载的对应镜像")
+        raise HTTPException(400, f"{node.label} 中未找到已启用且已下载的 {virtualization.upper()} 镜像：{image_id}")
     plan = await db.get(Plan, plan_id) if plan_id else Plan(name=name, slug=slug, price_cents=price_cents, cpu=cpu, memory_mb=memory_mb, disk_gb=disk_gb)
     for key, value in {"name": name, "slug": slug, "description": description, "price_cents": price_cents, "months": months, "stock": stock, "cpu": cpu, "memory_mb": memory_mb, "disk_gb": disk_gb, "traffic_gb": traffic_gb, "network_down_mbps": network_down_mbps, "network_up_mbps": network_up_mbps, "virtualization": virtualization, "clicd_node": node.base_url, "clicd_image": image_id, "clicd_template_name": str(matched.get("name") or matched.get("label") or image_id), "clicd_validated_at": datetime.utcnow(), "assign_nat": assign_nat, "assign_ipv4": assign_ipv4, "assign_ipv6": assign_ipv6, "active": active}.items():
         setattr(plan, key, value)
@@ -912,7 +917,15 @@ async def test_service(service: str, request: Request, csrf: str = Form(), recip
     check_csrf(request, csrf)
     if service == "clicd":
         nodes = await clicd_nodes(db)
-        await asyncio.gather(*(node.client().test() for node in nodes))
+
+        async def check_clicd(node: CLICDNode):
+            client = node.client()
+            await client.test()
+            result = await client.templates()
+            if result.get("errors"):
+                raise CLICDError(f"{node.label}: {'；'.join(result['errors'])}")
+
+        await asyncio.gather(*(check_clicd(node) for node in nodes))
     elif service == "smtp":
         await send_mail(db, recipient, "VPS-ONE SMTP 测试", "邮件配置工作正常。")
     elif service == "hashpay":
