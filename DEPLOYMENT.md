@@ -15,7 +15,7 @@ This is a ONEMAN IDC project bootstrapped with python3.
 - Debian 11+/Ubuntu 20.04+，或 CentOS Stream/RHEL 8+，Docker环境
 - 1 核 CPU、1 GB 内存、10 GB 可用磁盘起步
 - 已开放 TCP 9080；生产环境建议由 Nginx/Caddy 反代并启用 HTTPS
-- CLICD API Key / HashPay 商户
+- HashPay 商户；销售云主机时还需 CLICD API Key
 
 ## 2. 一键安装
 
@@ -42,7 +42,7 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/oneman-idc/idc-o
    - HashPay 地址、商户 ID、私钥和平台公钥。
    - SMTP Host、Port、加密方式、账号、授权码与发件地址。
 3. 分别点击 CLICD、HashPay、SMTP 测试按钮。
-4. 在“套餐管理”配置 CLICD 节点、镜像、资源、网络和有效月份。
+4. 在“套餐管理”创建产品；云主机需配置 CLICD 节点、镜像和资源，自动发卡套餐则导入卡密库存。
 5. HashPay 回调地址为 `https://你的域名/hashpay/callback`。
 
 ### 多 CLICD 节点
@@ -60,6 +60,14 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/oneman-idc/idc-o
 - 仅已交付订单可在支付后 24 小时内提交撤销，每个用户滚动 24 小时内最多提交 5 次。
 - 撤销需使用注册邮箱收取 6 位确认码；确认码 15 分钟有效，连续错误 5 次后锁定，每笔申请最多发送 5 封确认邮件。生产环境必须先验证 SMTP 可正常投递。
 - 管理员在 `/admin/refunds` 审核。批准后后台任务先销毁关联 CLICD 实例，再将费用退入用户钱包；失败会保留原因并可安全重试。该流程不会向原 HashPay 支付渠道发起原路退款。
+
+### 自动发卡套餐
+
+- `/admin/plans` 可创建“自动发卡”套餐。卡密按每行一条导入，去重后使用 `MASTER_KEY` 加密保存；套餐库存由可用卡密数量自动计算，不调用 CLICD。
+- 用户可直接复用钱包或 HashPay 购买。支付成功后系统固定分配一条卡密并通过后台任务发送至注册邮箱；SMTP 临时失败会按队列策略重试，后台也可手动重试。
+- 商城、Dashboard 和个人中心只展示脱敏摘要（末 4 位），卡密全文仅写入 SMTP 邮件。用户可在已交付订单中重新发送邮件，频率限制为每小时 3 次。
+- 已交付的数字卡密不进入云主机 24 小时自助撤销流程，避免卡密泄露后重复销售。售后需由运营人员核验使用状态后线下处理。
+- 备份或迁移时必须同时保存 `.env` 中的 `MASTER_KEY` 和 `SECRET_KEY`：前者用于解密库存，后者用于卡密去重指纹；任一密钥丢失都会影响现有库存维护。
 
 ## 4. 运维命令
 

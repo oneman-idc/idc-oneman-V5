@@ -15,6 +15,8 @@
   <main class="content">
     <div class="eyebrow">PRODUCTS</div>
     <h1>套餐管理</h1>
+    {% if request.query_params.get('cards_added') is not none %}<div class="notice success-text">卡密导入完成：新增 {{ request.query_params.get('cards_added') }} 条，跳过 {{ request.query_params.get('cards_skipped') or 0 }} 条。</div>{% endif %}
+    {% if request.query_params.get('delivery_retry') %}<div class="notice success-text">发卡任务已重新进入队列。</div>{% endif %}
     <div class="split">
       <section class="card">
         <h2>新增套餐</h2>
@@ -24,20 +26,28 @@
             <label class="field">名称<input name="name" required></label>
             <label class="field">唯一标识<input name="slug" pattern="[a-z0-9-]+" required></label>
             <label class="field wide">说明<input name="description"></label>
+            <label class="field">套餐类型<select id="plan-product-type" name="product_type"><option value="cloud">云主机</option><option value="card">自动发卡</option></select></label>
             <label class="field">价格（分）<input type="number" name="price_cents" min="1" required></label>
-            <label class="field">周期（月）<input type="number" name="months" min="1" value="1" required></label>
-            <label class="field">库存（-1 无限）<input type="number" name="stock" min="-1" value="-1"></label>
-            <label class="field">vCPU<input type="number" name="cpu" min="1" required></label>
-            <label class="field">内存 MB<input type="number" name="memory_mb" min="128" required></label>
-            <label class="field">磁盘 GB<input type="number" name="disk_gb" min="1" required></label>
-            <label class="field">月流量 GB<input type="number" name="traffic_gb" min="0" value="0"></label>
-            <label class="field">下行 Mbps<input type="number" name="network_down_mbps" min="0" value="100"></label>
-            <label class="field">上行 Mbps<input type="number" name="network_up_mbps" min="0" value="50"></label>
-            <label class="field">虚拟化<select id="plan-virtualization" name="virtualization"><option value="lxc">LXC</option><option value="kvm">KVM</option></select></label>
-            <label class="field wide">CLICD 节点与镜像<select id="plan-clicd-image" name="clicd_image" required><option value="">请选择 LXC 节点与镜像</option>{% for image in templates_list %}<option value="{{image._clicd_choice}}" data-virtualization="{{image.type}}">{{image._clicd_node_label}} · {{image.name or image.label or image.id}} · {{image.type|upper}}</option>{% endfor %}</select></label>
-            {% if error %}<div class="notice danger wide">{{error}}，请先完成系统配置。</div>{% endif %}
+            <div id="plan-cloud-fields" class="product-fields">
+              <label class="field">周期（月）<input type="number" name="months" min="1" value="1" required></label>
+              <label class="field">库存（-1 无限）<input type="number" name="stock" min="-1" value="-1"></label>
+              <label class="field">vCPU<input type="number" name="cpu" min="1" required></label>
+              <label class="field">内存 MB<input type="number" name="memory_mb" min="128" required></label>
+              <label class="field">磁盘 GB<input type="number" name="disk_gb" min="1" required></label>
+              <label class="field">月流量 GB<input type="number" name="traffic_gb" min="0" value="0"></label>
+              <label class="field">下行 Mbps<input type="number" name="network_down_mbps" min="0" value="100"></label>
+              <label class="field">上行 Mbps<input type="number" name="network_up_mbps" min="0" value="50"></label>
+              <label class="field">虚拟化<select id="plan-virtualization" name="virtualization"><option value="lxc">LXC</option><option value="kvm">KVM</option></select></label>
+              <label class="field wide">CLICD 节点与镜像<select id="plan-clicd-image" name="clicd_image" required><option value="">请选择 LXC 节点与镜像</option>{% for image in templates_list %}<option value="{{image._clicd_choice}}" data-virtualization="{{image.type}}">{{image._clicd_node_label}} · {{image.name or image.label or image.id}} · {{image.type|upper}}</option>{% endfor %}</select></label>
+              {% if error %}<div class="notice danger wide">{{error}}，云主机套餐需先完成系统配置。</div>{% endif %}
+            </div>
+            <div id="plan-card-fields" class="product-fields" hidden>
+              <label class="field wide">交付说明<textarea name="card_delivery_note" rows="3" maxlength="2000" placeholder="使用范围、有效期或兑换方式"></textarea></label>
+              <label class="field wide">初始卡密库存<textarea name="card_inventory" rows="8" placeholder="每行一条卡密，支付成功后按导入顺序发放"></textarea></label>
+            </div>
           </div>
-          <div class="checks"><label><input id="plan-assign-nat" type="checkbox" name="assign_nat" checked aria-controls="plan-nat-port-control"> NAT</label><label id="plan-nat-port-control">端口数量 <input id="plan-nat-port-count" class="nat-count-input" type="number" name="port_mapping_count" min="2" max="64" value="2" inputmode="numeric" required></label><label><input type="checkbox" name="assign_ipv6" checked> IPv6</label><label><input type="checkbox" name="assign_ipv4"> 公网 IPv4</label><label><input type="checkbox" name="active" checked> 上架</label></div>
+          <div id="plan-cloud-checks" class="checks"><label><input id="plan-assign-nat" type="checkbox" name="assign_nat" checked aria-controls="plan-nat-port-control"> NAT</label><label id="plan-nat-port-control">端口数量 <input id="plan-nat-port-count" class="nat-count-input" type="number" name="port_mapping_count" min="2" max="64" value="2" inputmode="numeric" required></label><label><input type="checkbox" name="assign_ipv6" checked> IPv6</label><label><input type="checkbox" name="assign_ipv4"> 公网 IPv4</label></div>
+          <div class="checks"><label><input type="checkbox" name="active" checked> 上架</label></div>
           <button class="btn">保存套餐</button>
         </form>
       </section>
@@ -45,22 +55,26 @@
         <div class="plan-list">
           {% for p in plans %}
           <article class="card">
-            <div class="row"><div><div class="eyebrow">{{p.slug}}</div><h3>{{p.name}}</h3></div><span class="status {% if not p.active %}danger{% endif %}">{{'上架' if p.active else '下架'}}</span></div>
+            <div class="row"><div><div class="eyebrow">{{p.slug}} · {{'自动发卡' if p.product_type == 'card' else '云主机'}}</div><h3>{{p.name}}</h3></div><span class="status {% if not p.active %}danger{% endif %}">{{'上架' if p.active else '下架'}}</span></div>
             <p>{{p.description}}</p>
-            <div class="specs"><span>¥{{'%.2f'|format(p.price_cents/100)}} / {{p.months}} 月</span><span>{{p.cpu}} vCPU · {{p.memory_mb}} MB · {{p.disk_gb}} GB</span><span>{{p.virtualization|upper}} · {{p.clicd_image}}</span><span>{{p.clicd_node or '默认 CLICD 节点'}}</span><span>{% if p.assign_nat %}NAT · {{p.port_mapping_count}} 个端口{% else %}NAT 已关闭{% endif %}</span></div>
+            {% if p.product_type == 'card' %}{% set counts = card_counts.get(p.id, {}) %}<div class="specs"><span>¥{{'%.2f'|format(p.price_cents/100)}} / 份</span><span>可用 {{counts.get('available', 0)}} · 已分配 {{counts.get('assigned', 0)}} · 已交付 {{counts.get('delivered', 0)}}</span><span>{{p.card_delivery_note or '无额外交付说明'}}</span></div><form class="card-import-form" method="post" action="/admin/plans/{{p.id}}/cards"><input type="hidden" name="csrf" value="{{csrf}}"><label class="field">追加卡密<textarea name="card_inventory" rows="4" placeholder="每行一条" required></textarea></label><button class="btn secondary small">导入库存</button></form>{% else %}<div class="specs"><span>¥{{'%.2f'|format(p.price_cents/100)}} / {{p.months}} 月</span><span>{{p.cpu}} vCPU · {{p.memory_mb}} MB · {{p.disk_gb}} GB</span><span>{{p.virtualization|upper}} · {{p.clicd_image}}</span><span>{{p.clicd_node or '默认 CLICD 节点'}}</span><span>{% if p.assign_nat %}NAT · {{p.port_mapping_count}} 个端口{% else %}NAT 已关闭{% endif %}</span></div>{% endif %}
             <form method="post" action="/admin/plans/{{p.id}}/toggle"><input type="hidden" name="csrf" value="{{csrf}}"><button class="btn ghost small">{{'下架' if p.active else '上架'}}</button></form>
           </article>
           {% else %}<div class="empty">暂无套餐</div>{% endfor %}
         </div>
       </section>
     </div>
+    <section class="admin-data-section"><div class="section-head compact"><div><div class="eyebrow">CARD DELIVERY</div><h2>最近发卡订单</h2></div></div><div class="table-wrap"><table><thead><tr><th>订单</th><th>套餐</th><th>脱敏卡密</th><th>邮件</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for order in card_orders %}{% set item = card_items.get(order.id) %}{% set job = card_jobs.get(order.id) %}<tr><td><code>{{order.order_no}}</code><small>{{order.created_at.strftime('%Y-%m-%d %H:%M')}}</small></td><td>{{plan_names.get(order.plan_id, '已下架套餐')}}</td><td><code>{{item.masked_value if item else '待分配'}}</code></td><td>{{item.email_sent_at.strftime('%Y-%m-%d %H:%M') if item and item.email_sent_at else '未发送'}}{% if item and item.error %}<small class="danger">{{item.error}}</small>{% endif %}</td><td>{{order_status_label(order.status)}}{% if job and job.error %}<small class="danger">{{job.error}}</small>{% endif %}</td><td>{% if order.status in ['paid','delivering','delivery_failed'] %}<form method="post" action="/admin/orders/{{order.id}}/card-delivery/retry"><input type="hidden" name="csrf" value="{{csrf}}"><button class="btn secondary small">重试发卡</button></form>{% else %}<span class="muted">已完成</span>{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="muted">暂无发卡订单</td></tr>{% endfor %}</tbody></table></div></section>
   </main>
 </div>
 <script>
 (() => {
+  const productType = document.getElementById("plan-product-type");
+  const cloudFields = document.getElementById("plan-cloud-fields");
+  const cardFields = document.getElementById("plan-card-fields");
+  const cloudChecks = document.getElementById("plan-cloud-checks");
   const virtualization = document.getElementById("plan-virtualization");
   const images = document.getElementById("plan-clicd-image");
-  if (!virtualization || !images) return;
   const placeholder = images.options[0];
   const syncImages = () => {
     const selectedType = virtualization.value;
@@ -90,6 +104,20 @@
   };
   assignNat.addEventListener("change", syncNatPorts);
   syncNatPorts();
+
+  const setGroup = (group, enabled) => {
+    group.hidden = !enabled;
+    group.querySelectorAll("input,select,textarea").forEach(control => control.disabled = !enabled);
+  };
+  const syncProductType = () => {
+    const cloud = productType.value === "cloud";
+    setGroup(cloudFields, cloud);
+    setGroup(cloudChecks, cloud);
+    setGroup(cardFields, !cloud);
+    if (cloud) { syncImages(); syncNatPorts(); }
+  };
+  productType.addEventListener("change", syncProductType);
+  syncProductType();
 })();
 </script>
 </body>

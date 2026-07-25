@@ -23,9 +23,10 @@ from websockets.asyncio.client import connect as websocket_connect
 
 from .config import settings
 from .database import SessionLocal, init_db, session, write_lock
-from .models import Audit, Instance, Job, Order, PaymentEvent, Plan, RefundRequest, User, WalletEntry, WalletTopUp
+from .models import Audit, CardItem, Instance, Job, Order, PaymentEvent, Plan, RefundRequest, User, WalletEntry, WalletTopUp
 from .security import confirmation_code, confirmation_hash, csrf_token, decrypt, encrypt, hash_password, read_session, session_token, valid_confirmation, valid_csrf, verify_password
 from .services.accounts import ensure_wallet, generate_login_name, parse_money_cents, payment_amount_cents, post_wallet_entry, refund_deadline, refund_eligible
+from .services.cards import import_card_items, reserve_card_item, reveal_card_secret
 from .services.clicd import CLICD, CLICDError, CLICD_USER_AGENT, container_details, container_items, container_status, extract_access, normalize_virtualization, plan_payload, unwrap_data
 from .services.hashpay import HashPay
 from .services.mailer import MailDeliveryError, send_mail
@@ -255,7 +256,7 @@ def unwrap(result):
 
 
 def plan_snapshot(plan: Plan) -> str:
-    fields = ["name", "description", "price_cents", "currency", "months", "cpu", "memory_mb", "disk_gb", "traffic_gb", "network_down_mbps", "network_up_mbps", "virtualization", "clicd_node", "clicd_image", "assign_nat", "port_mapping_count"]
+    fields = ["name", "description", "product_type", "card_delivery_note", "price_cents", "currency", "months", "cpu", "memory_mb", "disk_gb", "traffic_gb", "network_down_mbps", "network_up_mbps", "virtualization", "clicd_node", "clicd_image", "assign_nat", "port_mapping_count"]
     return json.dumps({field: getattr(plan, field) for field in fields}, ensure_ascii=False)
 
 
@@ -279,7 +280,7 @@ def safe_status_label(status: str) -> str:
 
 
 def order_status_label(status: str) -> str:
-    return {"pending": "待支付", "payment_pending": "待支付", "payment_error": "支付失败", "paid": "已支付", "provisioning": "交付中", "fulfilled": "已完成", "refunded": "已退款"}.get(status, status)
+    return {"pending": "待支付", "payment_pending": "待支付", "payment_error": "支付失败", "paid": "已支付", "provisioning": "交付中", "delivering": "发卡中", "delivery_failed": "发卡异常", "fulfilled": "已完成", "refunded": "已退款"}.get(status, status)
 
 
 def refund_status_label(status: str) -> str:
@@ -304,7 +305,11 @@ def snapshot_data(order: Order, plan: Plan) -> dict:
         value = json.loads(order.plan_snapshot or "{}")
     except (TypeError, ValueError):
         value = {}
-    return value if isinstance(value, dict) and value else {field: getattr(plan, field, "") for field in ("name", "cpu", "memory_mb", "disk_gb", "traffic_gb", "network_down_mbps", "network_up_mbps", "clicd_image", "assign_nat", "port_mapping_count")}
+    return value if isinstance(value, dict) and value else {field: getattr(plan, field, "") for field in ("name", "product_type", "card_delivery_note", "cpu", "memory_mb", "disk_gb", "traffic_gb", "network_down_mbps", "network_up_mbps", "clicd_image", "assign_nat", "port_mapping_count")}
+
+
+def order_job_kind(order: Order) -> str:
+    return "deliver_card" if (order.product_type or "cloud") == "card" else "provision"
 
 
 def instance_card(instance: Instance, order: Order, plan: Plan, remote: dict | None = None) -> dict:
@@ -389,6 +394,71 @@ async def send_refund_confirmation(db, refund: RefundRequest, user: User, order:
     )
 
 
+async def send_card_credentials(db, order: Order, user: User, plan: Plan, item: CardItem) -> None:
+    package = snapshot_data(order, plan)
+    note = str(package.get("card_delivery_note") or plan.card_delivery_note or "").strip()
+    note_section = f"\n使用说明：{note}\n" if note else "\n"
+    await send_mail(
+        db,
+        user.email,
+        f"订单 {order.order_no} 卡密已交付",
+        f"您购买的数字商品已完成交付。\n\n商品：{package.get('name') or plan.name}\n订单：{order.order_no}\n卡密：{reveal_card_secret(item)}\n{note_section}\n卡密全文仅发送至注册邮箱，请妥善保管并尽快使用。",
+    )
+
+
+async def process_card_delivery(db, order_id: int, resend: bool = False) -> None:
+    order = await db.get(Order, order_id)
+    if not order or order.product_type != "card":
+        raise RuntimeError("发卡任务对应的订单无效")
+    if resend and order.status != "fulfilled":
+        raise RuntimeError("仅已交付订单可以重新发送卡密")
+    if not resend and order.status == "fulfilled":
+        return
+    if not resend and order.status not in {"paid", "delivering", "delivery_failed"}:
+        raise RuntimeError("发卡订单当前状态不可交付")
+    plan = await db.get(Plan, order.plan_id)
+    user = await db.get(User, order.user_id)
+    if not plan or plan.product_type != "card" or not user:
+        raise RuntimeError("发卡任务缺少用户或套餐数据")
+    try:
+        async with write_lock:
+            if resend:
+                item = (await db.execute(select(CardItem).where(CardItem.order_id == order.id))).scalar_one_or_none()
+                if not item:
+                    raise RuntimeError("订单缺少已分配卡密")
+            else:
+                item = await reserve_card_item(db, order, plan)
+            item.email_attempts += 1
+            item.error = ""
+            if not resend:
+                order.status = "delivering"
+            await db.commit()
+        await send_card_credentials(db, order, user, plan, item)
+        async with write_lock:
+            await db.refresh(item)
+            await db.refresh(order)
+            now = datetime.utcnow()
+            item.status = "delivered"
+            item.delivered_at = item.delivered_at or now
+            item.email_sent_at = now
+            item.error = ""
+            if not resend:
+                order.status = "fulfilled"
+                order.fulfilled_at = order.fulfilled_at or now
+            db.add(Audit(user_id=user.id, action="card.email.resent" if resend else "card.delivered", detail=f"{order.order_no} · {item.masked_value}"))
+            await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        failed_order = await db.get(Order, order_id)
+        failed_item = (await db.execute(select(CardItem).where(CardItem.order_id == order_id))).scalar_one_or_none()
+        if failed_item:
+            failed_item.error = str(exc)[:1000]
+        if failed_order and not resend and failed_order.status != "fulfilled":
+            failed_order.status = "delivery_failed"
+        await db.commit()
+        raise
+
+
 async def process_refund(db, refund_id: int):
     refund = await db.get(RefundRequest, refund_id)
     if not refund or refund.status == "completed" or refund.status not in {"approved", "processing", "processing_failed"}:
@@ -441,6 +511,10 @@ async def process_refund(db, refund_id: int):
 async def process_job(db, job: Job):
     if job.kind == "provision":
         await provision(db, job.ref_id)
+    elif job.kind == "deliver_card":
+        await process_card_delivery(db, job.ref_id)
+    elif job.kind == "mail_card":
+        await process_card_delivery(db, job.ref_id, resend=True)
     elif job.kind == "mail_instance":
         instance = await db.get(Instance, job.ref_id)
         if not instance:
@@ -503,7 +577,7 @@ async def worker():
 
 async def provision(db, order_id: int):
     order = await db.get(Order, order_id)
-    if not order or order.status not in {"paid", "provisioning"}:
+    if not order or order.product_type != "cloud" or order.status not in {"paid", "provisioning"}:
         return
     plan = await db.get(Plan, order.plan_id)
     existing = (await db.execute(select(Instance).where(Instance.order_id == order.id))).scalar_one_or_none()
@@ -694,7 +768,7 @@ async def create_order(request: Request, plan_id: int = Form(), csrf: str = Form
     if not plan or not plan.active or plan.stock == 0 or payment_method not in {"hashpay", "wallet"}:
         raise HTTPException(404, "套餐不可购买")
     order_no = "VP" + datetime.utcnow().strftime("%Y%m%d%H%M%S") + secrets.token_hex(3).upper()
-    order = Order(order_no=order_no, user_id=user["uid"], plan_id=plan.id, plan_snapshot=plan_snapshot(plan), amount_cents=plan.price_cents, currency=plan.currency, payment_method=payment_method)
+    order = Order(order_no=order_no, user_id=user["uid"], plan_id=plan.id, plan_snapshot=plan_snapshot(plan), amount_cents=plan.price_cents, currency=plan.currency, product_type=plan.product_type, payment_method=payment_method)
     if payment_method == "wallet":
         try:
             async with write_lock:
@@ -703,22 +777,25 @@ async def create_order(request: Request, plan_id: int = Form(), csrf: str = Form
                     raise ValueError("钱包币种与套餐币种不一致")
                 db.add(order)
                 await db.flush()
+                if order.product_type == "card":
+                    await reserve_card_item(db, order, plan)
                 await post_wallet_entry(db, wallet, -plan.price_cents, "purchase", "order", order.id, f"购买套餐 {plan.name}")
                 order.status, order.paid_at = "paid", datetime.utcnow()
-                db.add(Job(kind="provision", ref_id=order.id))
+                db.add(Job(kind=order_job_kind(order), ref_id=order.id))
                 db.add(Audit(user_id=user["uid"], action="wallet.purchase", detail=order_no, ip=request.client.host if request.client else ""))
                 await db.commit()
         except ValueError as exc:
             await db.rollback()
             raise HTTPException(409, str(exc)) from exc
-        return RedirectResponse("/dashboard?wallet_purchase=1", 303)
+        return RedirectResponse("/account?card_purchase=1#orders" if order.product_type == "card" else "/dashboard?wallet_purchase=1", 303)
     order_id: int | None = None
     try:
         db.add(order)
         await db.commit()
         await db.refresh(order)
         order_id = order.id
-        checkout_url, order.hashpay_id = await hashpay_checkout(db, order_no, plan.price_cents, plan.currency, plan.name, "/dashboard")
+        return_path = "/account?payment=returned#orders" if order.product_type == "card" else "/dashboard"
+        checkout_url, order.hashpay_id = await hashpay_checkout(db, order_no, plan.price_cents, plan.currency, plan.name, return_path)
         order.checkout_url = checkout_url
         order.status = "payment_pending"
         await db.commit()
@@ -772,7 +849,16 @@ async def callback(request: Request, db=Depends(session)):
             raise HTTPException(400, "支付数据不匹配")
         if order and order.status in {"pending", "payment_pending", "payment_error"}:
             order.status, order.paid_at = "paid", datetime.utcnow()
-            db.add(Job(kind="provision", ref_id=order.id))
+            if order.product_type == "card":
+                plan = await db.get(Plan, order.plan_id)
+                if not plan or plan.product_type != "card":
+                    raise HTTPException(409, "发卡套餐不存在或类型不匹配")
+                try:
+                    await reserve_card_item(db, order, plan)
+                except ValueError as exc:
+                    order.status = "delivery_failed"
+                    db.add(Audit(user_id=order.user_id, action="card.stock.shortage", detail=f"{order.order_no} · {exc}"))
+            db.add(Job(kind=order_job_kind(order), ref_id=order.id))
         elif topup and topup.status != "paid":
             wallet = await ensure_wallet(db, topup.user_id, topup.currency)
             await post_wallet_entry(db, wallet, topup.amount_cents, "topup", "topup", topup.id, f"钱包充值 {topup.topup_no}")
@@ -823,8 +909,8 @@ async def dashboard(request: Request, db=Depends(session)):
             logger.warning("容器列表同步失败：%s", exc)
     order_by_id = {order.id: order for order in orders}
     cards = [instance_card(instance, order_by_id[instance.order_id], plans[instance.plan_id], remote_by_id.get((instance.clicd_node, str(instance.clicd_id)))) for instance in instances if instance.order_id in order_by_id and instance.plan_id in plans and order_by_id[instance.order_id].status != "refunded"]
-    jobs = {job.ref_id: job for job in (await db.execute(select(Job).where(Job.kind == "provision", Job.ref_id.in_({order.id for order in orders})))).scalars().all()} if orders else {}
-    return templates.TemplateResponse("dashboard.html", ctx(request, account_user=account_user, orders=orders, cards=cards, plans=plans, jobs=jobs, status_label=safe_status_label))
+    jobs = {job.ref_id: job for job in (await db.execute(select(Job).where(Job.kind.in_({"provision", "deliver_card"}), Job.ref_id.in_({order.id for order in orders})))).scalars().all()} if orders else {}
+    return templates.TemplateResponse("dashboard.html", ctx(request, account_user=account_user, orders=orders, cards=cards, plans=plans, jobs=jobs, status_label=safe_status_label, order_status_label=order_status_label))
 
 
 @app.get("/account", response_class=HTMLResponse)
@@ -842,6 +928,7 @@ async def account(request: Request, db=Depends(session)):
         latest_refunds.setdefault(refund.order_id, refund)
     plans = {plan.id: plan for plan in (await db.execute(select(Plan).where(Plan.id.in_({order.plan_id for order in orders})))).scalars().all()} if orders else {}
     instances = {instance.order_id: instance for instance in (await db.execute(select(Instance).where(Instance.user_id == account_user.id))).scalars().all()}
+    card_items = {item.order_id: item for item in (await db.execute(select(CardItem).where(CardItem.order_id.in_({order.id for order in orders})))).scalars().all()} if orders else {}
     recent_request_count = await db.scalar(select(func.count(RefundRequest.id)).where(RefundRequest.user_id == account_user.id, RefundRequest.requested_at >= datetime.utcnow() - timedelta(hours=24))) or 0
     order_rows = []
     for order in orders:
@@ -851,6 +938,7 @@ async def account(request: Request, db=Depends(session)):
             "order": order,
             "package": snapshot_data(order, plans.get(order.plan_id)) if plans.get(order.plan_id) else {},
             "instance": instances.get(order.id),
+            "card_item": card_items.get(order.id),
             "refund": refund,
             "refund_deadline": refund_deadline(order),
             "can_refund": refund_eligible(order) and not blocked and recent_request_count < REFUND_MAX_REQUESTS_24H,
@@ -866,6 +954,30 @@ async def account(request: Request, db=Depends(session)):
         order_status_label=order_status_label,
         refund_status_label=refund_status_label,
     ))
+
+
+@app.post("/account/orders/{order_id}/card-email")
+async def resend_card_email(order_id: int, request: Request, csrf: str = Form(), db=Depends(session)):
+    session_user = guard(request)
+    check_csrf(request, csrf)
+    limit(request, f"card-email:{session_user['uid']}", 3, 3600)
+    async with write_lock:
+        order = await db.get(Order, order_id)
+        if not order or order.user_id != session_user["uid"]:
+            raise HTTPException(404)
+        if order.product_type != "card" or order.status != "fulfilled":
+            raise HTTPException(409, "该订单当前不能重新发送卡密")
+        item = (await db.execute(select(CardItem).where(CardItem.order_id == order.id))).scalar_one_or_none()
+        if not item:
+            raise HTTPException(409, "订单缺少已交付卡密")
+        job = (await db.execute(select(Job).where(Job.kind == "mail_card", Job.ref_id == order.id))).scalar_one_or_none()
+        if not job:
+            db.add(Job(kind="mail_card", ref_id=order.id))
+        else:
+            job.status, job.attempts, job.error, job.locked_at, job.run_after = "pending", 0, "", None, datetime.utcnow()
+        db.add(Audit(user_id=session_user["uid"], action="card.email.request", detail=f"{order.order_no} · {item.masked_value}", ip=request.client.host if request.client else ""))
+        await db.commit()
+    return RedirectResponse("/account?card_mail=queued#orders", 303)
 
 
 @app.post("/account/wallet/topups")
@@ -911,6 +1023,8 @@ async def request_refund(order_id: int, request: Request, csrf: str = Form(), re
         order = await db.get(Order, order_id)
         if not order or order.user_id != session_user["uid"]:
             raise HTTPException(404)
+        if order.product_type != "cloud":
+            raise HTTPException(409, "数字卡密商品交付后不支持自助撤销")
         if not refund_eligible(order):
             raise HTTPException(409, "该订单不在支付后 24 小时撤销窗口内")
         account_user = await db.get(User, session_user["uid"])
@@ -1195,11 +1309,11 @@ async def add_port(instance_id: int, request: Request, csrf: str = Form(), proto
 @app.get("/admin", response_class=HTMLResponse)
 async def admin(request: Request, db=Depends(session)):
     guard(request, True)
-    models = {"用户": User, "套餐": Plan, "订单": Order, "实例": Instance, "退款申请": RefundRequest, "任务": Job}
+    models = {"用户": User, "套餐": Plan, "订单": Order, "实例": Instance, "卡密": CardItem, "退款申请": RefundRequest, "任务": Job}
     stats = {name: await db.scalar(select(func.count(model.id))) for name, model in models.items()}
     orders = (await db.execute(select(Order).order_by(Order.id.desc()).limit(30))).scalars().all()
     jobs = (await db.execute(select(Job).order_by(Job.id.desc()).limit(30))).scalars().all()
-    return templates.TemplateResponse("admin.html", ctx(request, stats=stats, orders=orders, jobs=jobs))
+    return templates.TemplateResponse("admin.html", ctx(request, stats=stats, orders=orders, jobs=jobs, order_status_label=order_status_label))
 
 
 @app.get("/admin/refunds", response_class=HTMLResponse)
@@ -1356,6 +1470,12 @@ async def admin_product_delete(container_ref: str, request: Request, csrf: str =
 async def admin_plans(request: Request, db=Depends(session)):
     guard(request, True)
     plans = (await db.execute(select(Plan).order_by(Plan.sort_order, Plan.id))).scalars().all()
+    card_counts: dict[int, dict[str, int]] = {}
+    for plan_id, status, count in (await db.execute(select(CardItem.plan_id, CardItem.status, func.count(CardItem.id)).group_by(CardItem.plan_id, CardItem.status))).all():
+        card_counts.setdefault(plan_id, {})[status] = count
+    card_orders = (await db.execute(select(Order).where(Order.product_type == "card").order_by(Order.id.desc()).limit(50))).scalars().all()
+    card_items = {item.order_id: item for item in (await db.execute(select(CardItem).where(CardItem.order_id.in_({order.id for order in card_orders})))).scalars().all()} if card_orders else {}
+    card_jobs = {job.ref_id: job for job in (await db.execute(select(Job).where(Job.kind == "deliver_card", Job.ref_id.in_({order.id for order in card_orders})))).scalars().all()} if card_orders else {}
     templates_list, error = [], ""
     try:
         nodes = await clicd_nodes(db)
@@ -1377,15 +1497,46 @@ async def admin_plans(request: Request, db=Depends(session)):
         error = "; ".join(errors)
     except Exception as exc:
         error = str(exc)
-    return templates.TemplateResponse("admin_plans.html", ctx(request, plans=plans, templates_list=templates_list, error=error))
+    return templates.TemplateResponse("admin_plans.html", ctx(request, plans=plans, templates_list=templates_list, error=error, card_counts=card_counts, card_orders=card_orders, card_items=card_items, card_jobs=card_jobs, plan_names={plan.id: plan.name for plan in plans}, order_status_label=order_status_label))
 
 
 @app.post("/admin/plans")
-async def save_plan(request: Request, csrf: str = Form(), plan_id: int = Form(0), name: str = Form(), slug: str = Form(), description: str = Form(""), price_cents: int = Form(), months: int = Form(1), stock: int = Form(-1), cpu: int = Form(), memory_mb: int = Form(), disk_gb: int = Form(), traffic_gb: int = Form(), network_down_mbps: int = Form(), network_up_mbps: int = Form(), virtualization: str = Form("lxc"), clicd_image: str = Form(), assign_nat: bool = Form(False), port_mapping_count: int = Form(2), assign_ipv4: bool = Form(False), assign_ipv6: bool = Form(False), active: bool = Form(False), db=Depends(session)):
+async def save_plan(request: Request, csrf: str = Form(), plan_id: int = Form(0), product_type: str = Form("cloud"), name: str = Form(), slug: str = Form(), description: str = Form(""), price_cents: int = Form(), months: int = Form(1), stock: int = Form(-1), cpu: int = Form(1), memory_mb: int = Form(128), disk_gb: int = Form(1), traffic_gb: int = Form(0), network_down_mbps: int = Form(100), network_up_mbps: int = Form(50), virtualization: str = Form("lxc"), clicd_image: str = Form(""), card_delivery_note: str = Form(""), card_inventory: str = Form(""), assign_nat: bool = Form(False), port_mapping_count: int = Form(2), assign_ipv4: bool = Form(False), assign_ipv6: bool = Form(False), active: bool = Form(False), db=Depends(session)):
     user = guard(request, True)
     check_csrf(request, csrf)
-    if virtualization not in {"lxc", "kvm"} or min(price_cents, months, cpu, memory_mb, disk_gb) < 1:
+    name, slug = name.strip(), slug.strip().lower()
+    if product_type not in {"cloud", "card"} or not name or not re.fullmatch(r"[a-z0-9-]+", slug) or price_cents < 1:
         raise HTTPException(400, "套餐字段无效")
+    duplicate = (await db.execute(select(Plan).where(Plan.slug == slug, Plan.id != plan_id))).scalar_one_or_none()
+    if duplicate:
+        raise HTTPException(409, "套餐唯一标识已存在")
+    plan = await db.get(Plan, plan_id) if plan_id else Plan(name=name, slug=slug, price_cents=price_cents, cpu=0, memory_mb=0, disk_gb=0)
+    if not plan:
+        raise HTTPException(404)
+    for key, value in {"name": name, "slug": slug, "description": description.strip()[:2000], "price_cents": price_cents, "product_type": product_type, "active": active}.items():
+        setattr(plan, key, value)
+    if product_type == "card":
+        plan.months = 1
+        plan.cpu = plan.memory_mb = plan.disk_gb = plan.traffic_gb = 0
+        plan.network_down_mbps = plan.network_up_mbps = 0
+        plan.virtualization = "card"
+        plan.clicd_node = plan.clicd_image = plan.clicd_template_name = ""
+        plan.clicd_validated_at = None
+        plan.assign_nat = plan.assign_ipv4 = plan.assign_ipv6 = False
+        plan.port_mapping_count = 0
+        plan.card_delivery_note = card_delivery_note.strip()[:2000]
+        db.add(plan)
+        await db.flush()
+        try:
+            added, skipped = await import_card_items(db, plan, card_inventory)
+        except ValueError as exc:
+            await db.rollback()
+            raise HTTPException(400, str(exc)) from exc
+        db.add(Audit(user_id=user["uid"], action="plan.card.save", detail=f"{slug} · 导入 {added} · 跳过 {skipped}"))
+        await db.commit()
+        return RedirectResponse(f"/admin/plans?cards_added={added}&cards_skipped={skipped}", 303)
+    if virtualization not in {"lxc", "kvm"} or min(months, cpu, memory_mb, disk_gb) < 1:
+        raise HTTPException(400, "云主机套餐字段无效")
     if assign_nat and not 2 <= port_mapping_count <= 64:
         raise HTTPException(400, "NAT 端口数量必须在 2 到 64 之间")
     nat_port_count = port_mapping_count if assign_nat else 0
@@ -1396,13 +1547,62 @@ async def save_plan(request: Request, csrf: str = Form(), plan_id: int = Form(0)
     matched = next((item for item in images if normalize_virtualization(item.get("type") or item.get("virtualization")) == virtualization and str(item.get("id") or item.get("template_id") or item.get("slug")) == image_id), None)
     if not matched:
         raise HTTPException(400, f"{node.label} 中未找到已启用且已下载的 {virtualization.upper()} 镜像：{image_id}")
-    plan = await db.get(Plan, plan_id) if plan_id else Plan(name=name, slug=slug, price_cents=price_cents, cpu=cpu, memory_mb=memory_mb, disk_gb=disk_gb)
-    for key, value in {"name": name, "slug": slug, "description": description, "price_cents": price_cents, "months": months, "stock": stock, "cpu": cpu, "memory_mb": memory_mb, "disk_gb": disk_gb, "traffic_gb": traffic_gb, "network_down_mbps": network_down_mbps, "network_up_mbps": network_up_mbps, "virtualization": virtualization, "clicd_node": node.base_url, "clicd_image": image_id, "clicd_template_name": str(matched.get("name") or matched.get("label") or image_id), "clicd_validated_at": datetime.utcnow(), "assign_nat": assign_nat, "port_mapping_count": nat_port_count, "assign_ipv4": assign_ipv4, "assign_ipv6": assign_ipv6, "active": active}.items():
+    for key, value in {"card_delivery_note": "", "months": months, "stock": stock, "cpu": cpu, "memory_mb": memory_mb, "disk_gb": disk_gb, "traffic_gb": traffic_gb, "network_down_mbps": network_down_mbps, "network_up_mbps": network_up_mbps, "virtualization": virtualization, "clicd_node": node.base_url, "clicd_image": image_id, "clicd_template_name": str(matched.get("name") or matched.get("label") or image_id), "clicd_validated_at": datetime.utcnow(), "assign_nat": assign_nat, "port_mapping_count": nat_port_count, "assign_ipv4": assign_ipv4, "assign_ipv6": assign_ipv6}.items():
         setattr(plan, key, value)
     db.add(plan)
     db.add(Audit(user_id=user["uid"], action="plan.save", detail=slug))
     await db.commit()
     return RedirectResponse("/admin/plans", 303)
+
+
+@app.post("/admin/plans/{plan_id}/cards")
+async def add_plan_cards(plan_id: int, request: Request, csrf: str = Form(), card_inventory: str = Form(), db=Depends(session)):
+    user = guard(request, True)
+    check_csrf(request, csrf)
+    async with write_lock:
+        plan = await db.get(Plan, plan_id)
+        if not plan or plan.product_type != "card":
+            raise HTTPException(404)
+        try:
+            added, skipped = await import_card_items(db, plan, card_inventory)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        available_budget = plan.stock
+        failed_orders = (await db.execute(select(Order).where(Order.plan_id == plan.id, Order.product_type == "card", Order.status == "delivery_failed").order_by(Order.paid_at, Order.id))).scalars().all()
+        for order in failed_orders:
+            assigned = (await db.execute(select(CardItem.id).where(CardItem.order_id == order.id))).scalar_one_or_none()
+            if not assigned and available_budget <= 0:
+                continue
+            if not assigned:
+                available_budget -= 1
+            job = (await db.execute(select(Job).where(Job.kind == "deliver_card", Job.ref_id == order.id))).scalar_one_or_none()
+            if not job:
+                db.add(Job(kind="deliver_card", ref_id=order.id))
+            else:
+                job.status, job.attempts, job.error, job.locked_at, job.run_after = "pending", 0, "", None, datetime.utcnow()
+            order.status = "paid"
+        db.add(Audit(user_id=user["uid"], action="plan.card.import", detail=f"{plan.slug} · 导入 {added} · 跳过 {skipped}"))
+        await db.commit()
+    return RedirectResponse(f"/admin/plans?cards_added={added}&cards_skipped={skipped}", 303)
+
+
+@app.post("/admin/orders/{order_id}/card-delivery/retry")
+async def retry_card_delivery(order_id: int, request: Request, csrf: str = Form(), db=Depends(session)):
+    user = guard(request, True)
+    check_csrf(request, csrf)
+    async with write_lock:
+        order = await db.get(Order, order_id)
+        if not order or order.product_type != "card" or order.status not in {"paid", "delivering", "delivery_failed"}:
+            raise HTTPException(409, "该订单当前不能重试发卡")
+        job = (await db.execute(select(Job).where(Job.kind == "deliver_card", Job.ref_id == order.id))).scalar_one_or_none()
+        if not job:
+            db.add(Job(kind="deliver_card", ref_id=order.id))
+        else:
+            job.status, job.attempts, job.error, job.locked_at, job.run_after = "pending", 0, "", None, datetime.utcnow()
+        order.status = "paid"
+        db.add(Audit(user_id=user["uid"], action="card.delivery.retry", detail=order.order_no))
+        await db.commit()
+    return RedirectResponse("/admin/plans?delivery_retry=1", 303)
 
 
 @app.post("/admin/plans/{plan_id}/toggle")

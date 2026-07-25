@@ -44,7 +44,7 @@ def refund_deadline(order: Order) -> datetime | None:
 
 def refund_eligible(order: Order, now: datetime | None = None) -> bool:
     deadline = refund_deadline(order)
-    return bool(order.status == "fulfilled" and deadline and (now or datetime.utcnow()) <= deadline)
+    return bool((order.product_type or "cloud") == "cloud" and order.status == "fulfilled" and deadline and (now or datetime.utcnow()) <= deadline)
 
 
 async def ensure_wallet(db: AsyncSession, user_id: int, currency: str = "CNY") -> Wallet:
