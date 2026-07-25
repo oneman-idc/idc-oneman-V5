@@ -14,6 +14,9 @@ def read_session(token:str|None):
     except BadSignature:return None
 def csrf_token(token:str)->str:return hmac.new(cfg.secret_key.encode(),token.encode(),hashlib.sha256).hexdigest()
 def valid_csrf(token:str,provided:str)->bool:return bool(provided and hmac.compare_digest(csrf_token(token),provided))
+def confirmation_code()->str:return f"{secrets.randbelow(1_000_000):06d}"
+def confirmation_hash(purpose:str,code:str)->str:return hmac.new(cfg.secret_key.encode(),f"{purpose}:{code}".encode(),hashlib.sha256).hexdigest()
+def valid_confirmation(purpose:str,code:str,expected:str)->bool:return bool(expected and hmac.compare_digest(confirmation_hash(purpose,code),expected))
 def fernet():return Fernet(__import__('base64').urlsafe_b64encode(hashlib.sha256(cfg.master_key.encode()).digest()))
 def encrypt(v:str)->str:return fernet().encrypt(v.encode()).decode()
 def decrypt(v:str)->str:return fernet().decrypt(v.encode()).decode()

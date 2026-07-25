@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Index
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -10,6 +10,7 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(6), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(190), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -63,12 +64,88 @@ class Order(Base):
     amount_cents: Mapped[int] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(8))
     status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    payment_method: Mapped[str] = mapped_column(String(16), default="hashpay")
     hashpay_id: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
     checkout_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     __table_args__ = (Index("ix_orders_user_status", "user_id", "status"),)
+
+
+class Wallet(Base):
+    __tablename__ = "wallets"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    balance_cents: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (CheckConstraint("balance_cents >= 0", name="ck_wallet_balance_nonnegative"),)
+
+
+class WalletEntry(Base):
+    __tablename__ = "wallet_entries"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entry_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(24), index=True)
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    balance_after_cents: Mapped[int] = mapped_column(Integer)
+    reference_type: Mapped[str] = mapped_column(String(24))
+    reference_id: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(String(300), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        CheckConstraint("amount_cents != 0", name="ck_wallet_entry_amount_nonzero"),
+        CheckConstraint("balance_after_cents >= 0", name="ck_wallet_entry_balance_nonnegative"),
+        UniqueConstraint("wallet_id", "kind", "reference_type", "reference_id", name="uq_wallet_entry_reference"),
+    )
+
+
+class WalletTopUp(Base):
+    __tablename__ = "wallet_topups"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    topup_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    wallet_id: Mapped[int] = mapped_column(ForeignKey("wallets.id"), index=True)
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    hashpay_id: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
+    checkout_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (CheckConstraint("amount_cents > 0", name="ck_wallet_topup_amount_positive"),)
+
+
+class RefundRequest(Base):
+    __tablename__ = "refund_requests"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    refund_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    status: Mapped[str] = mapped_column(String(32), default="confirmation_pending", index=True)
+    reason: Mapped[str] = mapped_column(String(500), default="")
+    confirmation_hash: Mapped[str] = mapped_column(String(64), default="")
+    confirmation_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    confirmation_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    email_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    requested_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    review_note: Mapped[str] = mapped_column(String(500), default="")
+    container_deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    __table_args__ = (
+        CheckConstraint("amount_cents > 0", name="ck_refund_request_amount_positive"),
+        Index("ix_refund_requests_user_status", "user_id", "status"),
+    )
 
 
 class Instance(Base):

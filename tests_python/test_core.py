@@ -2,17 +2,19 @@ import base64
 import json
 import time
 import pytest
+import vps_one.main as main_module
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
-from vps_one.database import migrate_instance_identity, normalize_plan_nat_port_counts
-from vps_one.main import app, consume_vnc_session, containers_by_node, create_vnc_session, decode_clicd_ref, encode_clicd_ref, encrypted_access, instance_access, instance_card, instance_mail_text, node_for_instance, node_from_ref, parse_clicd_nodes, parse_plan_image_choice, plan_image_choice
-from vps_one.models import Instance, Order, Plan, Setting
-from vps_one.security import decrypt, encrypt, hash_password, verify_password
-from datetime import datetime, timezone
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from vps_one.database import backfill_accounts, migrate_instance_identity, normalize_plan_nat_port_counts
+from vps_one.main import app, consume_vnc_session, containers_by_node, create_vnc_session, decode_clicd_ref, encode_clicd_ref, encrypted_access, instance_access, instance_card, instance_mail_text, node_for_instance, node_from_ref, parse_clicd_nodes, parse_plan_image_choice, plan_image_choice, process_refund
+from vps_one.models import Base, Instance, Order, Plan, RefundRequest, Setting, User, WalletEntry, WalletTopUp
+from vps_one.security import confirmation_code, confirmation_hash, csrf_token, decrypt, encrypt, hash_password, session_token, valid_confirmation, verify_password
+from datetime import datetime, timedelta, timezone
+from vps_one.services.accounts import ensure_wallet, generate_login_name, parse_money_cents, payment_amount_cents, post_wallet_entry, refund_eligible
 from vps_one.services.clicd import CLICD, CLICDError, container_details, container_items, container_status, enabled_image_items, expiration_date, extract_access, normalize_virtualization, plan_payload, reset_password_value
 from vps_one.services.hashpay import HashPay
 
@@ -151,6 +153,11 @@ def test_clicd_action_routes_do_not_shadow_specialized_routes():
     assert "/instances/{instance_id}/port" in paths
     assert "/instances/{instance_id}/vnc-session" in paths
     assert "/instances/{instance_id}/vnc" in paths
+    assert "/account" in paths
+    assert "/account/wallet/topups" in paths
+    assert "/account/orders/{order_id}/refunds" in paths
+    assert "/admin/refunds" in paths
+    assert "/admin/refunds/{refund_id}/approve" in paths
     assert "/admin/products/{container_ref}/actions/{action}" in paths
     assert "/admin/products/{container_ref}/limits" in paths
     assert "/admin/products/{container_ref}/delete" in paths
@@ -188,6 +195,149 @@ async def test_plan_nat_port_count_migration():
         await normalize_plan_nat_port_counts(conn)
         rows = (await conn.execute(text("SELECT assign_nat,port_mapping_count FROM plans ORDER BY id"))).all()
         assert rows == [(1, 2), (0, 0), (1, 64), (1, 8)]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_account_backfill_adds_unique_login_names_and_wallets():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY, username VARCHAR(6))"))
+        await conn.execute(text("CREATE TABLE wallets (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, currency VARCHAR(8) NOT NULL, balance_cents INTEGER NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"))
+        await conn.execute(text("INSERT INTO users (id,username) VALUES (1,NULL),(2,'MEMBER'),(3,'member'),(4,'member')"))
+        await backfill_accounts(conn)
+        users = (await conn.execute(text("SELECT username FROM users ORDER BY id"))).scalars().all()
+        wallets = (await conn.execute(text("SELECT user_id,balance_cents FROM wallets ORDER BY user_id"))).all()
+        assert len(set(users)) == 4
+        assert all(len(username) == 6 and username.isalpha() and username.islower() for username in users)
+        assert wallets == [(1, 0), (2, 0), (3, 0), (4, 0)]
+    await engine.dispose()
+
+
+def test_account_value_objects_and_refund_window():
+    username = generate_login_name({"aaaaaa", "bbbbbb"})
+    assert len(username) == 6 and username.isalpha() and username.islower()
+    assert parse_money_cents("100.05") == 10005
+    assert payment_amount_cents("100.05") == 10005
+    assert payment_amount_cents(0.1) == 10
+    with pytest.raises(ValueError):
+        parse_money_cents("1.001")
+    with pytest.raises(ValueError):
+        payment_amount_cents("1.001")
+    now = datetime.utcnow()
+    order = Order(order_no="VP-REFUND", user_id=1, plan_id=1, amount_cents=1999, currency="CNY", status="fulfilled", paid_at=now)
+    assert refund_eligible(order, now + timedelta(hours=23, minutes=59))
+    assert not refund_eligible(order, now + timedelta(hours=24, seconds=1))
+    code = confirmation_code()
+    digest = confirmation_hash("RF-1", code)
+    assert len(code) == 6 and code.isdigit()
+    assert valid_confirmation("RF-1", code, digest)
+    assert not valid_confirmation("RF-1", "000000" if code != "000000" else "111111", digest)
+
+
+@pytest.mark.asyncio
+async def test_wallet_ledger_is_balanced_and_idempotent():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with sessions() as db:
+        user = User(username="wallet", email="wallet@example.com", password_hash="hash")
+        db.add(user)
+        await db.flush()
+        wallet = await ensure_wallet(db, user.id)
+        credit = await post_wallet_entry(db, wallet, 5000, "topup", "topup", 1, "充值")
+        duplicate = await post_wallet_entry(db, wallet, 5000, "topup", "topup", 1, "充值")
+        await post_wallet_entry(db, wallet, -1900, "purchase", "order", 1, "购买套餐")
+        with pytest.raises(ValueError, match="余额不足"):
+            await post_wallet_entry(db, wallet, -4000, "purchase", "order", 2, "余额不足")
+        await db.commit()
+        assert credit.id == duplicate.id
+        assert wallet.balance_cents == 3100
+        assert await db.scalar(select(func.count(WalletEntry.id))) == 2
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_wallet_topup_checkout_failure_is_persisted(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async def checkout_failure(*args, **kwargs):
+        raise RuntimeError("HashPay unavailable")
+
+    monkeypatch.setattr(main_module, "hashpay_checkout", checkout_failure)
+    async with sessions() as db:
+        user = User(username="failed", email="failed@example.com", password_hash="hash")
+        db.add(user)
+        await db.flush()
+        await ensure_wallet(db, user.id)
+        await db.commit()
+        cookie = session_token(user.id, False)
+        request = main_module.Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/account/wallet/topups",
+            "headers": [(b"cookie", f"vps_session={cookie}".encode())],
+            "client": ("127.0.0.1", 12345),
+        })
+        with pytest.raises(main_module.HTTPException) as error:
+            await main_module.create_wallet_topup(request, csrf_token(cookie), "25.00", db)
+        assert error.value.status_code == 502
+        topup = (await db.execute(select(WalletTopUp))).scalar_one()
+        assert topup.status == "payment_error"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_refund_job_deletes_instance_and_credits_wallet_once(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    deleted = []
+
+    class Client:
+        async def delete(self, instance_id):
+            deleted.append(instance_id)
+
+    class Node:
+        def client(self):
+            return Client()
+
+    async def fake_node_for_instance(db, instance, nodes=None):
+        return Node()
+
+    monkeypatch.setattr(main_module, "node_for_instance", fake_node_for_instance)
+    async with sessions() as db:
+        user = User(username="refund", email="refund@example.com", password_hash="hash")
+        admin = User(username="adminx", email="admin@example.com", password_hash="hash", is_admin=True)
+        plan = Plan(name="KVM", slug="refund-kvm", price_cents=2999, cpu=1, memory_mb=512, disk_gb=10)
+        db.add_all([user, admin, plan])
+        await db.flush()
+        order = Order(order_no="VP-REFUND-JOB", user_id=user.id, plan_id=plan.id, amount_cents=2999, currency="CNY", status="fulfilled", paid_at=datetime.utcnow(), fulfilled_at=datetime.utcnow())
+        db.add(order)
+        await db.flush()
+        instance = Instance(user_id=user.id, order_id=order.id, plan_id=plan.id, clicd_id="ct-refund", clicd_node="https://panel.example.com", name="VPS-REFUND", status="running")
+        refund = RefundRequest(refund_no="RF-REFUND-JOB", order_id=order.id, user_id=user.id, amount_cents=2999, currency="CNY", status="approved", reviewed_by=admin.id)
+        db.add_all([instance, refund])
+        await ensure_wallet(db, user.id)
+        await db.commit()
+        await process_refund(db, refund.id)
+        await db.refresh(refund)
+        await db.refresh(order)
+        await db.refresh(instance)
+        wallet = await ensure_wallet(db, user.id)
+        assert refund.status == "completed"
+        assert order.status == "refunded"
+        assert instance.status == "deleted"
+        assert wallet.balance_cents == 2999
+        assert deleted == ["ct-refund"]
+        await process_refund(db, refund.id)
+        assert await db.scalar(select(func.count(WalletEntry.id))) == 1
+        assert deleted == ["ct-refund"]
     await engine.dispose()
 
 
