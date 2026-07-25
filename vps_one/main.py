@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import re
@@ -22,11 +23,12 @@ from websockets.asyncio.client import connect as websocket_connect
 
 from .config import settings
 from .database import SessionLocal, init_db, session, write_lock
-from .models import Audit, Instance, Job, Order, PaymentEvent, Plan, User
-from .security import csrf_token, decrypt, encrypt, hash_password, read_session, session_token, valid_csrf, verify_password
+from .models import Audit, Instance, Job, Order, PaymentEvent, Plan, RefundRequest, User, WalletEntry, WalletTopUp
+from .security import confirmation_code, confirmation_hash, csrf_token, decrypt, encrypt, hash_password, read_session, session_token, valid_confirmation, valid_csrf, verify_password
+from .services.accounts import ensure_wallet, generate_login_name, parse_money_cents, payment_amount_cents, post_wallet_entry, refund_deadline, refund_eligible
 from .services.clicd import CLICD, CLICDError, CLICD_USER_AGENT, container_details, container_items, container_status, extract_access, normalize_virtualization, plan_payload, unwrap_data
 from .services.hashpay import HashPay
-from .services.mailer import send_mail
+from .services.mailer import MailDeliveryError, send_mail
 from .services.settings import get, set_many
 
 cfg = settings()
@@ -35,6 +37,9 @@ templates = Jinja2Templates(root / "templates")
 rate_buckets: dict[str, list[float]] = {}
 logger = logging.getLogger("vps_one.worker")
 VNC_SESSION_TTL = 55
+REFUND_CONFIRMATION_TTL = timedelta(minutes=15)
+REFUND_MAX_REQUESTS_24H = 5
+REFUND_ACTIVE_STATUSES = {"confirmation_pending", "confirmation_locked", "email_failed", "expired", "pending_review", "approved", "processing", "processing_failed"}
 
 
 @dataclass(frozen=True)
@@ -273,6 +278,18 @@ def safe_status_label(status: str) -> str:
     return {"running": "运行中", "stopped": "已关机", "starting": "启动中", "stopping": "关机中", "restarting": "重启中", "creating": "创建中", "provisioning": "部署中", "pending": "等待中"}.get(status, "状态未知")
 
 
+def order_status_label(status: str) -> str:
+    return {"pending": "待支付", "payment_pending": "待支付", "payment_error": "支付失败", "paid": "已支付", "provisioning": "交付中", "fulfilled": "已完成", "refunded": "已退款"}.get(status, status)
+
+
+def refund_status_label(status: str) -> str:
+    return {
+        "confirmation_pending": "待邮箱确认", "confirmation_locked": "验证码已锁定", "email_failed": "邮件发送失败",
+        "pending_review": "待后台审核", "approved": "审核通过", "processing": "退款处理中",
+        "processing_failed": "处理失败", "rejected": "审核拒绝", "completed": "已退款", "expired": "已过期",
+    }.get(status, status)
+
+
 def stored_secret(value: str) -> str:
     if not value:
         return ""
@@ -297,6 +314,7 @@ def instance_card(instance: Instance, order: Order, plan: Plan, remote: dict | N
     virtualization = details.get("virtualization") or normalize_virtualization(package.get("virtualization")) or normalize_virtualization(plan.virtualization)
     return {
         "instance": instance,
+        "order": order,
         "package": package,
         "operating_system": details.get("operating_system") or package.get("clicd_image") or "未返回",
         "virtualization": virtualization,
@@ -335,6 +353,91 @@ SSH 密码：{card['ssh_password']}
 请妥善保存以上敏感信息。"""
 
 
+async def hashpay_checkout(db, merchant_no: str, amount_cents: int, currency: str, description: str, return_path: str) -> tuple[str, str | None]:
+    base = await get(db, "hashpay_base_url")
+    merchant = await get(db, "hashpay_merchant_id")
+    private_key = await get(db, "hashpay_private_key")
+    if not base or not merchant or not private_key:
+        raise ValueError("HashPay 配置不完整")
+    public_url = await site_url(db)
+    result = await HashPay(base, merchant, private_key).create({
+        "merchantNo": merchant_no,
+        "amount": f"{amount_cents / 100:.2f}",
+        "currency": currency,
+        "description": description,
+        "notify_url": public_url + "/hashpay/callback",
+        "return_url": public_url + return_path,
+    })
+    if not isinstance(result, dict):
+        raise ValueError("HashPay 返回格式错误")
+    nested = result.get("data") or result.get("order") or {}
+    data = nested if isinstance(nested, dict) else {}
+    checkout_url = result.get("checkoutUrl") or result.get("payUrl") or data.get("checkoutUrl") or data.get("payUrl")
+    if not checkout_url:
+        raise ValueError("HashPay 未返回支付链接")
+    hashpay_id = str(data.get("id") or data.get("orderId") or result.get("id") or result.get("orderId") or "") or None
+    return str(checkout_url), hashpay_id
+
+
+async def send_refund_confirmation(db, refund: RefundRequest, user: User, order: Order, code: str) -> None:
+    expiry = refund.confirmation_expires_at.strftime("%Y-%m-%d %H:%M UTC") if refund.confirmation_expires_at else "15 分钟后"
+    await send_mail(
+        db,
+        user.email,
+        f"订单 {order.order_no} 撤销确认码",
+        f"您正在申请撤销已完成订单 {order.order_no}。\n\n确认码：{code}\n退款金额：{order.currency} {order.amount_cents / 100:.2f}\n确认码有效期：{expiry}\n\n确认后申请将进入人工审核。审核通过后，对应 CLICD 容器会被销毁，费用退入与 {user.email} 关联的钱包。若非本人操作，请忽略此邮件并及时修改密码。",
+    )
+
+
+async def process_refund(db, refund_id: int):
+    refund = await db.get(RefundRequest, refund_id)
+    if not refund or refund.status == "completed" or refund.status not in {"approved", "processing", "processing_failed"}:
+        return
+    try:
+        order = await db.get(Order, refund.order_id)
+        instance = (await db.execute(select(Instance).where(Instance.order_id == refund.order_id))).scalar_one_or_none()
+        if not order or order.user_id != refund.user_id or order.status != "fulfilled":
+            raise RuntimeError("退款申请与可退订单不匹配")
+        if order.amount_cents != refund.amount_cents or order.currency != refund.currency:
+            raise RuntimeError("退款申请金额或币种与订单不匹配")
+        if not instance or instance.user_id != refund.user_id or not instance.clicd_id:
+            raise RuntimeError("退款订单缺少可销毁的 CLICD 实例")
+        refund.status, refund.error = "processing", ""
+        await db.commit()
+        if not refund.container_deleted_at:
+            client = (await node_for_instance(db, instance)).client()
+            try:
+                await client.delete(instance.clicd_id)
+            except CLICDError as exc:
+                if "404" not in str(exc):
+                    raise
+            refund.container_deleted_at = datetime.utcnow()
+            instance.status = "deleted"
+            await db.commit()
+        async with write_lock:
+            await db.refresh(refund)
+            wallet = await ensure_wallet(db, refund.user_id, refund.currency)
+            if wallet.currency != refund.currency:
+                raise RuntimeError("钱包币种与退款币种不一致")
+            await post_wallet_entry(db, wallet, refund.amount_cents, "refund", "refund", refund.id, f"订单 {order.order_no} 撤销退款")
+            now = datetime.utcnow()
+            refund.status = "completed"
+            refund.refunded_at = refund.refunded_at or now
+            refund.completed_at = now
+            refund.error = ""
+            order.status = "refunded"
+            db.add(Audit(user_id=refund.reviewed_by, action="refund.completed", detail=f"{refund.refund_no} · {order.order_no}"))
+            await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        failed = await db.get(RefundRequest, refund_id)
+        if failed and failed.status != "completed":
+            failed.status = "processing_failed"
+            failed.error = str(exc)[:1000]
+            await db.commit()
+        raise
+
+
 async def process_job(db, job: Job):
     if job.kind == "provision":
         await provision(db, job.ref_id)
@@ -350,6 +453,8 @@ async def process_job(db, job: Job):
         expiry = instance.expires_at.strftime("%Y-%m-%d") if instance.expires_at else "请登录客户中心查看"
         access = instance_access(instance)
         await send_mail(db, user.email, f"您的 VPS {instance.name} 已交付", f"套餐：{plan.name}\n订单：{order.order_no}\n实例：{instance.name}\n状态：{safe_status_label(instance.status)}\n到期日期：{expiry}\n\nCLICD 管理用户名：{access.get('username') or '未返回'}\n初始密码：{access.get('password') or '未返回'}\n访问码：{access.get('access_code') or '未返回'}\n管理地址：{access.get('management_url') or '请登录客户中心查看'}\n\n以上信息仅发送给订单注册邮箱，请妥善保存并及时修改初始密码。")
+    elif job.kind == "refund":
+        await process_refund(db, job.ref_id)
 
 
 async def recover_stale_jobs(db) -> int:
@@ -495,7 +600,12 @@ async def health():
 async def home(request: Request, db=Depends(session)):
     plans = (await db.execute(select(Plan).where(Plan.active.is_(True)).order_by(Plan.sort_order, Plan.price_cents))).scalars().all()
     site = {key: await get(db, key, default) for key, default in {"site_name": "VPS-ONE", "site_tagline": "高性能容器云", "site_footer": "稳定算力，专注增长"}.items()}
-    return templates.TemplateResponse("home.html", ctx(request, plans=plans, site=site))
+    signed_in = current(request)
+    account_user = await db.get(User, signed_in["uid"]) if signed_in else None
+    wallet = await ensure_wallet(db, account_user.id) if account_user else None
+    if account_user:
+        await db.commit()
+    return templates.TemplateResponse("home.html", ctx(request, plans=plans, site=site, account_user=account_user, wallet=wallet))
 
 
 @app.get("/install", response_class=HTMLResponse)
@@ -512,7 +622,10 @@ async def install(email: str = Form(), password: str = Form(), db=Depends(sessio
     async with write_lock:
         if await db.scalar(select(func.count(User.id))):
             raise HTTPException(403)
-        db.add(User(email=email.strip().lower(), password_hash=hash_password(password), is_admin=True))
+        admin_user = User(username=generate_login_name(), email=email.strip().lower(), password_hash=hash_password(password), is_admin=True)
+        db.add(admin_user)
+        await db.flush()
+        await ensure_wallet(db, admin_user.id)
         db.add_all([
             Plan(name="轻量云", slug="starter", description="开发与个人站点", price_cents=1999, cpu=1, memory_mb=1024, disk_gb=20, traffic_gb=500, network_down_mbps=100, network_up_mbps=50),
             Plan(name="标准云", slug="standard", description="企业应用首选", price_cents=3999, cpu=2, memory_mb=2048, disk_gb=40, traffic_gb=1000, network_down_mbps=200, network_up_mbps=100),
@@ -556,7 +669,11 @@ async def register(request: Request, email: str = Form(), password: str = Form()
     async with write_lock:
         if (await db.execute(select(User).where(User.email == email))).scalar_one_or_none():
             return templates.TemplateResponse("register.html", {"request": request, "error": "邮箱已注册"}, status_code=409)
-        db.add(User(email=email, password_hash=hash_password(password)))
+        existing_names = set((await db.execute(select(User.username))).scalars().all())
+        registered_user = User(username=generate_login_name(existing_names), email=email, password_hash=hash_password(password))
+        db.add(registered_user)
+        await db.flush()
+        await ensure_wallet(db, registered_user.id)
         await db.commit()
     return RedirectResponse("/login", 303)
 
@@ -569,38 +686,46 @@ async def logout():
 
 
 @app.post("/orders")
-async def create_order(request: Request, plan_id: int = Form(), csrf: str = Form(), db=Depends(session)):
+async def create_order(request: Request, plan_id: int = Form(), csrf: str = Form(), payment_method: str = Form("hashpay"), db=Depends(session)):
     user = guard(request)
     check_csrf(request, csrf)
     limit(request, "order", 10, 300)
     plan = await db.get(Plan, plan_id)
-    if not plan or not plan.active or plan.stock == 0:
+    if not plan or not plan.active or plan.stock == 0 or payment_method not in {"hashpay", "wallet"}:
         raise HTTPException(404, "套餐不可购买")
     order_no = "VP" + datetime.utcnow().strftime("%Y%m%d%H%M%S") + secrets.token_hex(3).upper()
-    order = Order(order_no=order_no, user_id=user["uid"], plan_id=plan.id, plan_snapshot=plan_snapshot(plan), amount_cents=plan.price_cents, currency=plan.currency)
+    order = Order(order_no=order_no, user_id=user["uid"], plan_id=plan.id, plan_snapshot=plan_snapshot(plan), amount_cents=plan.price_cents, currency=plan.currency, payment_method=payment_method)
+    if payment_method == "wallet":
+        try:
+            async with write_lock:
+                wallet = await ensure_wallet(db, user["uid"], plan.currency)
+                if wallet.currency != plan.currency:
+                    raise ValueError("钱包币种与套餐币种不一致")
+                db.add(order)
+                await db.flush()
+                await post_wallet_entry(db, wallet, -plan.price_cents, "purchase", "order", order.id, f"购买套餐 {plan.name}")
+                order.status, order.paid_at = "paid", datetime.utcnow()
+                db.add(Job(kind="provision", ref_id=order.id))
+                db.add(Audit(user_id=user["uid"], action="wallet.purchase", detail=order_no, ip=request.client.host if request.client else ""))
+                await db.commit()
+        except ValueError as exc:
+            await db.rollback()
+            raise HTTPException(409, str(exc)) from exc
+        return RedirectResponse("/dashboard?wallet_purchase=1", 303)
+    order_id: int | None = None
     try:
         db.add(order)
         await db.commit()
         await db.refresh(order)
-        base, merchant, private_key = await get(db, "hashpay_base_url"), await get(db, "hashpay_merchant_id"), await get(db, "hashpay_private_key")
-        if not base or not merchant or not private_key:
-            raise ValueError("HashPay 配置不完整")
-        public_url = await site_url(db)
-        result = await HashPay(base, merchant, private_key).create({"merchantNo": order_no, "amount": f"{plan.price_cents / 100:.2f}", "currency": plan.currency, "description": plan.name, "notify_url": public_url + "/hashpay/callback", "return_url": public_url + "/dashboard"})
-        if not isinstance(result, dict):
-            raise ValueError("HashPay 返回格式错误")
-        nested = result.get("data") or result.get("order") or {}
-        data = nested if isinstance(nested, dict) else {}
-        order.hashpay_id = str(data.get("id") or data.get("orderId") or result.get("id") or result.get("orderId") or "") or None
-        order.checkout_url = result.get("checkoutUrl") or result.get("payUrl") or data.get("checkoutUrl") or data.get("payUrl")
-        if not order.checkout_url:
-            raise ValueError("HashPay 未返回支付链接")
+        order_id = order.id
+        checkout_url, order.hashpay_id = await hashpay_checkout(db, order_no, plan.price_cents, plan.currency, plan.name, "/dashboard")
+        order.checkout_url = checkout_url
         order.status = "payment_pending"
         await db.commit()
     except Exception as exc:
         await db.rollback()
         try:
-            persisted = await db.get(Order, order.id) if order.id else None
+            persisted = await db.get(Order, order_id) if order_id else None
             if persisted:
                 persisted.status = "payment_error"
                 await db.commit()
@@ -609,7 +734,7 @@ async def create_order(request: Request, plan_id: int = Form(), csrf: str = Form
             logger.exception("订单 %s 支付失败状态保存失败", order_no)
         logger.exception("订单 %s 创建 HashPay 支付失败", order_no)
         raise HTTPException(502, f"支付订单创建失败：{exc}") from exc
-    return RedirectResponse(order.checkout_url, 303)
+    return RedirectResponse(checkout_url, 303)
 
 
 @app.post("/hashpay/callback")
@@ -624,24 +749,34 @@ async def callback(request: Request, db=Depends(session)):
         payload = HashPay("", "", private_key).decrypt_callback(raw)
     except Exception as exc:
         raise HTTPException(400, "HashPay 回调解密失败") from exc
-    order_no = str(payload.get("merchantNo") or "")
-    event_id = str(payload.get("eventId") or payload.get("id") or secrets.token_hex(16))
-    order = (await db.execute(select(Order).where(Order.order_no == order_no))).scalar_one_or_none()
-    if not order:
-        return JSONResponse({"error": "order not found"}, 404)
+    merchant_no = str(payload.get("merchantNo") or "")
+    event_id = str(payload.get("eventId") or payload.get("id") or hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest())
+    order = (await db.execute(select(Order).where(Order.order_no == merchant_no))).scalar_one_or_none()
+    topup = (await db.execute(select(WalletTopUp).where(WalletTopUp.topup_no == merchant_no))).scalar_one_or_none() if not order else None
+    target = order or topup
+    if not target:
+        return JSONResponse({"error": "payment reference not found"}, 404)
     async with write_lock:
         if (await db.execute(select(PaymentEvent).where(PaymentEvent.event_id == event_id))).scalar_one_or_none():
             return {"ok": True}
-        amount = round(float(payload.get("amount", 0)) * 100)
+        try:
+            amount = payment_amount_cents(payload.get("amount", 0))
+        except ValueError:
+            amount = -1
         status = str(payload.get("status", "")).lower()
-        verified = amount == order.amount_cents and status in {"paid", "success", "completed"}
-        db.add(PaymentEvent(event_id=event_id, order_no=order_no, platform_txn_id=str(payload.get("transactionId") or ""), verified=verified, payload=json.dumps(payload, ensure_ascii=False)))
+        currency_matches = str(payload.get("currency") or target.currency).upper() == target.currency.upper()
+        verified = amount == target.amount_cents and currency_matches and status in {"paid", "success", "completed"}
+        db.add(PaymentEvent(event_id=event_id, order_no=merchant_no, platform_txn_id=str(payload.get("transactionId") or ""), verified=verified, payload=json.dumps(payload, ensure_ascii=False)))
         if not verified:
             await db.commit()
             raise HTTPException(400, "支付数据不匹配")
-        if order.status not in {"paid", "provisioning", "fulfilled"}:
+        if order and order.status in {"pending", "payment_pending", "payment_error"}:
             order.status, order.paid_at = "paid", datetime.utcnow()
             db.add(Job(kind="provision", ref_id=order.id))
+        elif topup and topup.status != "paid":
+            wallet = await ensure_wallet(db, topup.user_id, topup.currency)
+            await post_wallet_entry(db, wallet, topup.amount_cents, "topup", "topup", topup.id, f"钱包充值 {topup.topup_no}")
+            topup.status, topup.paid_at = "paid", datetime.utcnow()
         await db.commit()
     return {"ok": True}
 
@@ -649,8 +784,9 @@ async def callback(request: Request, db=Depends(session)):
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, db=Depends(session)):
     user = guard(request)
+    account_user = await db.get(User, user["uid"])
     orders = (await db.execute(select(Order).where(Order.user_id == user["uid"]).order_by(Order.id.desc()).limit(100))).scalars().all()
-    instances = (await db.execute(select(Instance).where(Instance.user_id == user["uid"]).order_by(Instance.id.desc()).limit(100))).scalars().all()
+    instances = (await db.execute(select(Instance).where(Instance.user_id == user["uid"], Instance.status != "deleted").order_by(Instance.id.desc()).limit(100))).scalars().all()
     plans = {plan.id: plan for plan in (await db.execute(select(Plan).where(Plan.id.in_({order.plan_id for order in orders})))).scalars().all()} if orders else {}
     remote_by_id: dict[tuple[str, str], dict] = {}
     if instances:
@@ -686,9 +822,198 @@ async def dashboard(request: Request, db=Depends(session)):
         except Exception as exc:
             logger.warning("容器列表同步失败：%s", exc)
     order_by_id = {order.id: order for order in orders}
-    cards = [instance_card(instance, order_by_id[instance.order_id], plans[instance.plan_id], remote_by_id.get((instance.clicd_node, str(instance.clicd_id)))) for instance in instances if instance.order_id in order_by_id and instance.plan_id in plans]
+    cards = [instance_card(instance, order_by_id[instance.order_id], plans[instance.plan_id], remote_by_id.get((instance.clicd_node, str(instance.clicd_id)))) for instance in instances if instance.order_id in order_by_id and instance.plan_id in plans and order_by_id[instance.order_id].status != "refunded"]
     jobs = {job.ref_id: job for job in (await db.execute(select(Job).where(Job.kind == "provision", Job.ref_id.in_({order.id for order in orders})))).scalars().all()} if orders else {}
-    return templates.TemplateResponse("dashboard.html", ctx(request, orders=orders, cards=cards, plans=plans, jobs=jobs, status_label=safe_status_label))
+    return templates.TemplateResponse("dashboard.html", ctx(request, account_user=account_user, orders=orders, cards=cards, plans=plans, jobs=jobs, status_label=safe_status_label))
+
+
+@app.get("/account", response_class=HTMLResponse)
+async def account(request: Request, db=Depends(session)):
+    session_user = guard(request)
+    account_user = await db.get(User, session_user["uid"])
+    wallet = await ensure_wallet(db, account_user.id)
+    await db.commit()
+    orders = (await db.execute(select(Order).where(Order.user_id == account_user.id).order_by(Order.id.desc()).limit(100))).scalars().all()
+    entries = (await db.execute(select(WalletEntry).where(WalletEntry.wallet_id == wallet.id).order_by(WalletEntry.id.desc()).limit(30))).scalars().all()
+    topups = (await db.execute(select(WalletTopUp).where(WalletTopUp.user_id == account_user.id).order_by(WalletTopUp.id.desc()).limit(20))).scalars().all()
+    refunds = (await db.execute(select(RefundRequest).where(RefundRequest.user_id == account_user.id).order_by(RefundRequest.id.desc()).limit(100))).scalars().all()
+    latest_refunds: dict[int, RefundRequest] = {}
+    for refund in refunds:
+        latest_refunds.setdefault(refund.order_id, refund)
+    plans = {plan.id: plan for plan in (await db.execute(select(Plan).where(Plan.id.in_({order.plan_id for order in orders})))).scalars().all()} if orders else {}
+    instances = {instance.order_id: instance for instance in (await db.execute(select(Instance).where(Instance.user_id == account_user.id))).scalars().all()}
+    recent_request_count = await db.scalar(select(func.count(RefundRequest.id)).where(RefundRequest.user_id == account_user.id, RefundRequest.requested_at >= datetime.utcnow() - timedelta(hours=24))) or 0
+    order_rows = []
+    for order in orders:
+        refund = latest_refunds.get(order.id)
+        blocked = bool(refund and (refund.status in REFUND_ACTIVE_STATUSES or refund.status == "completed"))
+        order_rows.append({
+            "order": order,
+            "package": snapshot_data(order, plans.get(order.plan_id)) if plans.get(order.plan_id) else {},
+            "instance": instances.get(order.id),
+            "refund": refund,
+            "refund_deadline": refund_deadline(order),
+            "can_refund": refund_eligible(order) and not blocked and recent_request_count < REFUND_MAX_REQUESTS_24H,
+        })
+    return templates.TemplateResponse("account.html", ctx(
+        request,
+        account_user=account_user,
+        wallet=wallet,
+        entries=entries,
+        topups=topups,
+        order_rows=order_rows,
+        refund_requests_remaining=max(0, REFUND_MAX_REQUESTS_24H - recent_request_count),
+        order_status_label=order_status_label,
+        refund_status_label=refund_status_label,
+    ))
+
+
+@app.post("/account/wallet/topups")
+async def create_wallet_topup(request: Request, csrf: str = Form(), amount: str = Form(), db=Depends(session)):
+    session_user = guard(request)
+    check_csrf(request, csrf)
+    limit(request, "wallet-topup", 10, 600)
+    try:
+        amount_cents = parse_money_cents(amount)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    account_user = await db.get(User, session_user["uid"])
+    wallet = await ensure_wallet(db, account_user.id)
+    topup_no = "WU" + datetime.utcnow().strftime("%Y%m%d%H%M%S") + secrets.token_hex(3).upper()
+    topup = WalletTopUp(topup_no=topup_no, user_id=account_user.id, wallet_id=wallet.id, amount_cents=amount_cents, currency=wallet.currency)
+    db.add(topup)
+    await db.commit()
+    await db.refresh(topup)
+    topup_id = topup.id
+    try:
+        checkout_url, topup.hashpay_id = await hashpay_checkout(db, topup_no, amount_cents, wallet.currency, f"{account_user.username} 钱包充值", "/account?topup=returned")
+        topup.checkout_url = checkout_url
+        topup.status = "payment_pending"
+        db.add(Audit(user_id=account_user.id, action="wallet.topup.create", detail=topup_no, ip=request.client.host if request.client else ""))
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        persisted = await db.get(WalletTopUp, topup_id)
+        if persisted:
+            persisted.status = "payment_error"
+            await db.commit()
+        logger.exception("充值单 %s 创建 HashPay 支付失败", topup_no)
+        raise HTTPException(502, f"充值支付创建失败：{exc}") from exc
+    return RedirectResponse(checkout_url, 303)
+
+
+@app.post("/account/orders/{order_id}/refunds")
+async def request_refund(order_id: int, request: Request, csrf: str = Form(), reason: str = Form(""), db=Depends(session)):
+    session_user = guard(request)
+    check_csrf(request, csrf)
+    limit(request, f"refund-request:{session_user['uid']}", REFUND_MAX_REQUESTS_24H, 86400)
+    async with write_lock:
+        order = await db.get(Order, order_id)
+        if not order or order.user_id != session_user["uid"]:
+            raise HTTPException(404)
+        if not refund_eligible(order):
+            raise HTTPException(409, "该订单不在支付后 24 小时撤销窗口内")
+        account_user = await db.get(User, session_user["uid"])
+        recent_count = await db.scalar(select(func.count(RefundRequest.id)).where(RefundRequest.user_id == account_user.id, RefundRequest.requested_at >= datetime.utcnow() - timedelta(hours=24))) or 0
+        if recent_count >= REFUND_MAX_REQUESTS_24H:
+            raise HTTPException(429, "24 小时内最多提交 5 次撤销申请")
+        existing = (await db.execute(select(RefundRequest).where(RefundRequest.order_id == order.id).order_by(RefundRequest.id.desc()))).scalars().first()
+        if existing and (existing.status in REFUND_ACTIVE_STATUSES or existing.status == "completed"):
+            raise HTTPException(409, "该订单已有正在处理或已完成的撤销申请")
+        code = confirmation_code()
+        refund_no = "RF" + datetime.utcnow().strftime("%Y%m%d%H%M%S") + secrets.token_hex(3).upper()
+        refund = RefundRequest(
+            refund_no=refund_no,
+            order_id=order.id,
+            user_id=account_user.id,
+            amount_cents=order.amount_cents,
+            currency=order.currency,
+            reason=reason.strip()[:500],
+            confirmation_hash=confirmation_hash(refund_no, code),
+            confirmation_expires_at=datetime.utcnow() + REFUND_CONFIRMATION_TTL,
+            email_attempts=1,
+        )
+        db.add(refund)
+        db.add(Audit(user_id=account_user.id, action="refund.request", detail=f"{refund_no} · {order.order_no}", ip=request.client.host if request.client else ""))
+        await db.commit()
+    try:
+        await send_refund_confirmation(db, refund, account_user, order, code)
+        return RedirectResponse("/account?refund=code-sent#orders", 303)
+    except MailDeliveryError as exc:
+        async with write_lock:
+            await db.refresh(refund)
+            if refund.status == "confirmation_pending":
+                refund.status, refund.error = "email_failed", str(exc)[:1000]
+                await db.commit()
+        return RedirectResponse("/account?refund=mail-failed#orders", 303)
+
+
+@app.post("/account/refunds/{refund_id}/confirm")
+async def confirm_refund(refund_id: int, request: Request, csrf: str = Form(), code: str = Form(), db=Depends(session)):
+    session_user = guard(request)
+    check_csrf(request, csrf)
+    limit(request, f"refund-confirm:{refund_id}", 6, 900)
+    async with write_lock:
+        refund = await db.get(RefundRequest, refund_id)
+        if not refund or refund.user_id != session_user["uid"]:
+            raise HTTPException(404)
+        if refund.status != "confirmation_pending":
+            raise HTTPException(409, "该撤销申请当前不能确认")
+        if not refund.confirmation_expires_at or refund.confirmation_expires_at < datetime.utcnow():
+            refund.status = "expired"
+            await db.commit()
+            return RedirectResponse("/account?refund=code-expired#orders", 303)
+        if not valid_confirmation(refund.refund_no, code.strip(), refund.confirmation_hash):
+            refund.confirmation_attempts += 1
+            if refund.confirmation_attempts >= 5:
+                refund.status = "confirmation_locked"
+            await db.commit()
+            return RedirectResponse("/account?refund=invalid-code#orders", 303)
+        refund.status = "pending_review"
+        refund.confirmed_at = datetime.utcnow()
+        refund.confirmation_hash = ""
+        db.add(Audit(user_id=session_user["uid"], action="refund.confirm", detail=refund.refund_no, ip=request.client.host if request.client else ""))
+        await db.commit()
+    return RedirectResponse("/account?refund=confirmed#orders", 303)
+
+
+@app.post("/account/refunds/{refund_id}/resend")
+async def resend_refund_code(refund_id: int, request: Request, csrf: str = Form(), db=Depends(session)):
+    session_user = guard(request)
+    check_csrf(request, csrf)
+    limit(request, f"refund-resend:{refund_id}", 3, 3600)
+    async with write_lock:
+        refund = await db.get(RefundRequest, refund_id)
+        if not refund or refund.user_id != session_user["uid"]:
+            raise HTTPException(404)
+        if refund.status not in {"confirmation_pending", "confirmation_locked", "email_failed", "expired"} or refund.email_attempts >= 5:
+            raise HTTPException(409, "该撤销申请不能继续发送确认码")
+        order = await db.get(Order, refund.order_id)
+        deadline = refund_deadline(order) if order else None
+        if not deadline or deadline < datetime.utcnow():
+            refund.status = "expired"
+            await db.commit()
+            raise HTTPException(410, "订单撤销窗口已关闭")
+        account_user = await db.get(User, session_user["uid"])
+        code = confirmation_code()
+        refund.status = "confirmation_pending"
+        refund.confirmation_hash = confirmation_hash(refund.refund_no, code)
+        pending_hash = refund.confirmation_hash
+        refund.confirmation_expires_at = datetime.utcnow() + REFUND_CONFIRMATION_TTL
+        refund.confirmation_attempts = 0
+        refund.email_attempts += 1
+        refund.error = ""
+        await db.commit()
+    try:
+        await send_refund_confirmation(db, refund, account_user, order, code)
+        return RedirectResponse("/account?refund=code-sent#orders", 303)
+    except MailDeliveryError as exc:
+        async with write_lock:
+            await db.refresh(refund)
+            if refund.status == "confirmation_pending" and refund.confirmation_hash == pending_hash:
+                refund.status, refund.error = "email_failed", str(exc)[:1000]
+                await db.commit()
+        return RedirectResponse("/account?refund=mail-failed#orders", 303)
 
 
 @app.get("/instances/{instance_id}/access")
@@ -870,11 +1195,88 @@ async def add_port(instance_id: int, request: Request, csrf: str = Form(), proto
 @app.get("/admin", response_class=HTMLResponse)
 async def admin(request: Request, db=Depends(session)):
     guard(request, True)
-    models = {"用户": User, "套餐": Plan, "订单": Order, "实例": Instance, "任务": Job}
+    models = {"用户": User, "套餐": Plan, "订单": Order, "实例": Instance, "退款申请": RefundRequest, "任务": Job}
     stats = {name: await db.scalar(select(func.count(model.id))) for name, model in models.items()}
     orders = (await db.execute(select(Order).order_by(Order.id.desc()).limit(30))).scalars().all()
     jobs = (await db.execute(select(Job).order_by(Job.id.desc()).limit(30))).scalars().all()
     return templates.TemplateResponse("admin.html", ctx(request, stats=stats, orders=orders, jobs=jobs))
+
+
+@app.get("/admin/refunds", response_class=HTMLResponse)
+async def admin_refunds(request: Request, db=Depends(session)):
+    guard(request, True)
+    refunds = (await db.execute(select(RefundRequest).order_by(RefundRequest.id.desc()).limit(200))).scalars().all()
+    orders = {order.id: order for order in (await db.execute(select(Order).where(Order.id.in_({refund.order_id for refund in refunds})))).scalars().all()} if refunds else {}
+    users = {user.id: user for user in (await db.execute(select(User).where(User.id.in_({refund.user_id for refund in refunds})))).scalars().all()} if refunds else {}
+    instances = {instance.order_id: instance for instance in (await db.execute(select(Instance).where(Instance.order_id.in_({refund.order_id for refund in refunds})))).scalars().all()} if refunds else {}
+    jobs = {job.ref_id: job for job in (await db.execute(select(Job).where(Job.kind == "refund", Job.ref_id.in_({refund.id for refund in refunds})))).scalars().all()} if refunds else {}
+    pending_count = sum(refund.status == "pending_review" for refund in refunds)
+    return templates.TemplateResponse("admin_refunds.html", ctx(request, refunds=refunds, orders=orders, users=users, instances=instances, jobs=jobs, pending_count=pending_count, refund_status_label=refund_status_label))
+
+
+@app.post("/admin/refunds/{refund_id}/approve")
+async def approve_refund(refund_id: int, request: Request, csrf: str = Form(), review_note: str = Form(""), db=Depends(session)):
+    admin_user = guard(request, True)
+    check_csrf(request, csrf)
+    async with write_lock:
+        refund = await db.get(RefundRequest, refund_id)
+        if not refund:
+            raise HTTPException(404)
+        if refund.status != "pending_review":
+            raise HTTPException(409, "仅待审核申请可以批准")
+        refund.status = "approved"
+        refund.reviewed_at = datetime.utcnow()
+        refund.reviewed_by = admin_user["uid"]
+        refund.review_note = review_note.strip()[:500]
+        refund.error = ""
+        job = (await db.execute(select(Job).where(Job.kind == "refund", Job.ref_id == refund.id))).scalar_one_or_none()
+        if not job:
+            db.add(Job(kind="refund", ref_id=refund.id))
+        db.add(Audit(user_id=admin_user["uid"], action="refund.approve", detail=refund.refund_no, ip=request.client.host if request.client else ""))
+        await db.commit()
+    return RedirectResponse("/admin/refunds?approved=1", 303)
+
+
+@app.post("/admin/refunds/{refund_id}/reject")
+async def reject_refund(refund_id: int, request: Request, csrf: str = Form(), review_note: str = Form(), db=Depends(session)):
+    admin_user = guard(request, True)
+    check_csrf(request, csrf)
+    async with write_lock:
+        refund = await db.get(RefundRequest, refund_id)
+        if not refund:
+            raise HTTPException(404)
+        if refund.status != "pending_review":
+            raise HTTPException(409, "仅待审核申请可以拒绝")
+        if not review_note.strip():
+            raise HTTPException(400, "拒绝申请必须填写审核说明")
+        refund.status = "rejected"
+        refund.reviewed_at = datetime.utcnow()
+        refund.reviewed_by = admin_user["uid"]
+        refund.review_note = review_note.strip()[:500]
+        db.add(Audit(user_id=admin_user["uid"], action="refund.reject", detail=refund.refund_no, ip=request.client.host if request.client else ""))
+        await db.commit()
+    return RedirectResponse("/admin/refunds?rejected=1", 303)
+
+
+@app.post("/admin/refunds/{refund_id}/retry")
+async def retry_refund(refund_id: int, request: Request, csrf: str = Form(), db=Depends(session)):
+    admin_user = guard(request, True)
+    check_csrf(request, csrf)
+    async with write_lock:
+        refund = await db.get(RefundRequest, refund_id)
+        if not refund:
+            raise HTTPException(404)
+        if refund.status != "processing_failed":
+            raise HTTPException(409, "仅处理失败的退款可以重试")
+        job = (await db.execute(select(Job).where(Job.kind == "refund", Job.ref_id == refund.id))).scalar_one_or_none()
+        if not job:
+            db.add(Job(kind="refund", ref_id=refund.id))
+        else:
+            job.status, job.attempts, job.error, job.locked_at, job.run_after = "pending", 0, "", None, datetime.utcnow()
+        refund.status, refund.error = "approved", ""
+        db.add(Audit(user_id=admin_user["uid"], action="refund.retry", detail=refund.refund_no, ip=request.client.host if request.client else ""))
+        await db.commit()
+    return RedirectResponse("/admin/refunds?retry=1", 303)
 
 
 @app.get("/admin/products", response_class=HTMLResponse)
