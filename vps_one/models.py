@@ -26,6 +26,8 @@ class Plan(Base):
     slug: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     description: Mapped[str] = mapped_column(Text, default="")
     features_json: Mapped[str] = mapped_column(Text, default="[]")
+    product_type: Mapped[str] = mapped_column(String(16), default="cloud", index=True)
+    card_delivery_note: Mapped[str] = mapped_column(Text, default="")
     price_cents: Mapped[int] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(8), default="CNY")
     months: Mapped[int] = mapped_column(Integer, default=1)
@@ -64,6 +66,7 @@ class Order(Base):
     amount_cents: Mapped[int] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(8))
     status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    product_type: Mapped[str] = mapped_column(String(16), default="cloud", index=True)
     payment_method: Mapped[str] = mapped_column(String(16), default="hashpay")
     hashpay_id: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
     checkout_url: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -71,6 +74,28 @@ class Order(Base):
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     __table_args__ = (Index("ix_orders_user_status", "user_id", "status"),)
+
+
+class CardItem(Base):
+    __tablename__ = "card_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id"), index=True)
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), unique=True, nullable=True)
+    secret_ciphertext: Mapped[str] = mapped_column(Text)
+    secret_fingerprint: Mapped[str] = mapped_column(String(64))
+    masked_value: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(24), default="available", index=True)
+    assigned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    email_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    email_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        CheckConstraint("status IN ('available','assigned','delivered','disabled')", name="ck_card_item_status"),
+        UniqueConstraint("plan_id", "secret_fingerprint", name="uq_card_item_plan_fingerprint"),
+        Index("ix_card_items_plan_status", "plan_id", "status"),
+    )
 
 
 class Wallet(Base):

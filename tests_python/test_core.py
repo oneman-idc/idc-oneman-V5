@@ -9,12 +9,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from vps_one.database import backfill_accounts, migrate_instance_identity, normalize_plan_nat_port_counts
-from vps_one.main import app, consume_vnc_session, containers_by_node, create_vnc_session, decode_clicd_ref, encode_clicd_ref, encrypted_access, instance_access, instance_card, instance_mail_text, node_for_instance, node_from_ref, parse_clicd_nodes, parse_plan_image_choice, plan_image_choice, process_refund
-from vps_one.models import Base, Instance, Order, Plan, RefundRequest, Setting, User, WalletEntry, WalletTopUp
+from vps_one.database import backfill_accounts, migrate, migrate_instance_identity, normalize_plan_nat_port_counts
+from vps_one.main import app, consume_vnc_session, containers_by_node, create_vnc_session, decode_clicd_ref, encode_clicd_ref, encrypted_access, instance_access, instance_card, instance_mail_text, node_for_instance, node_from_ref, order_job_kind, parse_clicd_nodes, parse_plan_image_choice, plan_image_choice, process_card_delivery, process_refund
+from vps_one.models import Base, CardItem, Instance, Job, Order, Plan, RefundRequest, Setting, User, WalletEntry, WalletTopUp
 from vps_one.security import confirmation_code, confirmation_hash, csrf_token, decrypt, encrypt, hash_password, session_token, valid_confirmation, verify_password
 from datetime import datetime, timedelta, timezone
 from vps_one.services.accounts import ensure_wallet, generate_login_name, parse_money_cents, payment_amount_cents, post_wallet_entry, refund_eligible
+from vps_one.services.cards import card_fingerprint, card_lines, import_card_items, mask_card_secret, reserve_card_item, reveal_card_secret
 from vps_one.services.clicd import CLICD, CLICDError, container_details, container_items, container_status, enabled_image_items, expiration_date, extract_access, normalize_virtualization, plan_payload, reset_password_value
 from vps_one.services.hashpay import HashPay
 
@@ -155,12 +156,15 @@ def test_clicd_action_routes_do_not_shadow_specialized_routes():
     assert "/instances/{instance_id}/vnc" in paths
     assert "/account" in paths
     assert "/account/wallet/topups" in paths
+    assert "/account/orders/{order_id}/card-email" in paths
     assert "/account/orders/{order_id}/refunds" in paths
     assert "/admin/refunds" in paths
     assert "/admin/refunds/{refund_id}/approve" in paths
     assert "/admin/products/{container_ref}/actions/{action}" in paths
     assert "/admin/products/{container_ref}/limits" in paths
     assert "/admin/products/{container_ref}/delete" in paths
+    assert "/admin/plans/{plan_id}/cards" in paths
+    assert "/admin/orders/{order_id}/card-delivery/retry" in paths
 
 
 @pytest.mark.asyncio
@@ -228,11 +232,230 @@ def test_account_value_objects_and_refund_window():
     order = Order(order_no="VP-REFUND", user_id=1, plan_id=1, amount_cents=1999, currency="CNY", status="fulfilled", paid_at=now)
     assert refund_eligible(order, now + timedelta(hours=23, minutes=59))
     assert not refund_eligible(order, now + timedelta(hours=24, seconds=1))
+    order.product_type = "card"
+    assert not refund_eligible(order, now + timedelta(hours=1))
     code = confirmation_code()
     digest = confirmation_hash("RF-1", code)
     assert len(code) == 6 and code.isdigit()
     assert valid_confirmation("RF-1", code, digest)
     assert not valid_confirmation("RF-1", "000000" if code != "000000" else "111111", digest)
+
+
+@pytest.mark.asyncio
+async def test_card_product_migration_adds_types_and_inventory_table():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY)"))
+        await conn.execute(text("CREATE TABLE plans (id INTEGER PRIMARY KEY, name VARCHAR(100), price_cents INTEGER)"))
+        await conn.execute(text("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, status VARCHAR(24))"))
+        await conn.execute(text("INSERT INTO users(id) VALUES (1)"))
+        await conn.execute(text("INSERT INTO plans(id,name,price_cents) VALUES (1,'legacy',100)"))
+        await conn.execute(text("INSERT INTO orders(id,user_id,status) VALUES (1,1,'fulfilled')"))
+        await conn.run_sync(Base.metadata.create_all)
+        await migrate(conn)
+        plan_type = await conn.scalar(text("SELECT product_type FROM plans WHERE id=1"))
+        order_type = await conn.scalar(text("SELECT product_type FROM orders WHERE id=1"))
+        card_columns = {row[1] for row in await conn.execute(text("PRAGMA table_info(card_items)"))}
+        assert plan_type == order_type == "cloud"
+        assert {"secret_ciphertext", "secret_fingerprint", "masked_value", "email_sent_at"}.issubset(card_columns)
+    await engine.dispose()
+
+
+def test_card_value_normalization_mask_and_fingerprint():
+    assert card_lines("  first-secret-1234\r\n\nsecond-secret-5678\nfirst-secret-1234 ") == [
+        "first-secret-1234", "second-secret-5678", "first-secret-1234",
+    ]
+    assert mask_card_secret("first-secret-1234") == "********1234"
+    assert card_fingerprint("first-secret-1234") == card_fingerprint("first-secret-1234")
+    assert card_fingerprint("first-secret-1234") != card_fingerprint("second-secret-5678")
+
+
+@pytest.mark.asyncio
+async def test_card_inventory_is_encrypted_deduplicated_and_reserved_once():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with sessions() as db:
+        user = User(username="cardsa", email="cards@example.com", password_hash="hash")
+        plan = Plan(name="License", slug="license", product_type="card", price_cents=1000, cpu=0, memory_mb=0, disk_gb=0)
+        db.add_all([user, plan])
+        await db.flush()
+        added, skipped = await import_card_items(db, plan, "first-secret-1234\nsecond-secret-5678\nfirst-secret-1234")
+        order = Order(order_no="VP-CARD-1", user_id=user.id, plan_id=plan.id, amount_cents=1000, currency="CNY", product_type="card", status="paid")
+        db.add(order)
+        await db.flush()
+        reserved = await reserve_card_item(db, order, plan)
+        assert await reserve_card_item(db, order, plan) is reserved
+        await db.commit()
+        items = (await db.execute(select(CardItem).order_by(CardItem.id))).scalars().all()
+        assert (added, skipped, plan.stock) == (2, 1, 1)
+        assert len(items) == 2
+        assert all("secret-" not in item.secret_ciphertext for item in items)
+        assert reveal_card_secret(reserved) == "first-secret-1234"
+        assert reserved.masked_value == "********1234"
+        assert reserved.status == "assigned"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_wallet_card_purchase_routes_to_delivery_without_clicd(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async def forbidden_clicd(*args, **kwargs):
+        raise AssertionError("card purchases must not call CLICD")
+
+    monkeypatch.setattr(main_module, "clicd_nodes", forbidden_clicd)
+    main_module.rate_buckets.clear()
+    async with sessions() as db:
+        user = User(username="cardwb", email="wallet-card@example.com", password_hash="hash")
+        plan = Plan(name="Gift Card", slug="gift-card", product_type="card", price_cents=1200, cpu=0, memory_mb=0, disk_gb=0)
+        db.add_all([user, plan])
+        await db.flush()
+        await import_card_items(db, plan, "wallet-secret-4321")
+        wallet = await ensure_wallet(db, user.id)
+        wallet.balance_cents = 5000
+        await db.commit()
+        cookie = session_token(user.id, False)
+        request = main_module.Request({
+            "type": "http", "method": "POST", "path": "/orders",
+            "headers": [(b"cookie", f"vps_session={cookie}".encode())],
+            "client": ("127.0.0.1", 12345),
+        })
+        response = await main_module.create_order(request, plan.id, csrf_token(cookie), "wallet", db)
+        order = (await db.execute(select(Order))).scalar_one()
+        job = (await db.execute(select(Job))).scalar_one()
+        item = (await db.execute(select(CardItem))).scalar_one()
+        await db.refresh(wallet)
+        assert response.status_code == 303 and response.headers["location"].startswith("/account?card_purchase=1")
+        assert order.status == "paid" and order.product_type == "card"
+        assert job.kind == order_job_kind(order) == "deliver_card"
+        assert item.order_id == order.id and item.status == "assigned"
+        assert wallet.balance_cents == 3800 and plan.stock == 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_admin_card_plan_creation_does_not_call_clicd(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async def forbidden_clicd(*args, **kwargs):
+        raise AssertionError("card plan creation must not call CLICD")
+
+    monkeypatch.setattr(main_module, "clicd_nodes", forbidden_clicd)
+    async with sessions() as db:
+        admin = User(username="cardad", email="card-admin@example.com", password_hash="hash", is_admin=True)
+        db.add(admin)
+        await db.commit()
+        cookie = session_token(admin.id, True)
+        request = main_module.Request({
+            "type": "http", "method": "POST", "path": "/admin/plans",
+            "headers": [(b"cookie", f"vps_session={cookie}".encode())],
+            "client": ("127.0.0.1", 12345),
+        })
+        response = await main_module.save_plan(
+            request=request, csrf=csrf_token(cookie), plan_id=0, product_type="card",
+            name="Activation Code", slug="activation-code", description="Email delivery",
+            price_cents=1500, months=1, stock=-1, cpu=1, memory_mb=128, disk_gb=1,
+            traffic_gb=0, network_down_mbps=100, network_up_mbps=50,
+            virtualization="lxc", clicd_image="", card_delivery_note="Redeem online",
+            card_inventory="admin-secret-1111\nadmin-secret-2222", assign_nat=False,
+            port_mapping_count=2, assign_ipv4=False, assign_ipv6=False, active=True, db=db,
+        )
+        plan = (await db.execute(select(Plan))).scalar_one()
+        assert response.status_code == 303 and "cards_added=2" in response.headers["location"]
+        assert plan.product_type == "card" and plan.stock == 2
+        assert plan.clicd_node == plan.clicd_image == "" and plan.virtualization == "card"
+        assert await db.scalar(select(func.count(CardItem.id))) == 2
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_card_delivery_emails_full_secret_but_persists_only_masked_value(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sent = []
+
+    async def capture_mail(db, recipient, subject, body):
+        sent.append((recipient, subject, body))
+
+    async def forbidden_clicd(*args, **kwargs):
+        raise AssertionError("card delivery must not call CLICD")
+
+    monkeypatch.setattr(main_module, "send_mail", capture_mail)
+    monkeypatch.setattr(main_module, "clicd_nodes", forbidden_clicd)
+    async with sessions() as db:
+        user = User(username="cardem", email="delivery@example.com", password_hash="hash")
+        plan = Plan(name="Activation", slug="activation", product_type="card", card_delivery_note="在官网激活", price_cents=990, cpu=0, memory_mb=0, disk_gb=0)
+        db.add_all([user, plan])
+        await db.flush()
+        await import_card_items(db, plan, "mail-secret-9876")
+        order = Order(order_no="VP-CARD-MAIL", user_id=user.id, plan_id=plan.id, plan_snapshot=main_module.plan_snapshot(plan), amount_cents=990, currency="CNY", product_type="card", status="paid", paid_at=datetime.utcnow())
+        db.add(order)
+        await db.commit()
+        await process_card_delivery(db, order.id)
+        await db.refresh(order)
+        item = (await db.execute(select(CardItem))).scalar_one()
+        assert order.status == "fulfilled" and item.status == "delivered"
+        assert item.masked_value == "********9876" and "mail-secret-9876" not in item.secret_ciphertext
+        assert len(sent) == 1 and sent[0][0] == user.email
+        assert "mail-secret-9876" in sent[0][2] and "在官网激活" in sent[0][2]
+        await process_card_delivery(db, order.id)
+        assert len(sent) == 1
+        await process_card_delivery(db, order.id, resend=True)
+        assert len(sent) == 2 and item.email_attempts == 2
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_card_delivery_retry_keeps_the_original_assignment(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    attempts = []
+
+    async def fail_mail(db, recipient, subject, body):
+        attempts.append(body)
+        raise RuntimeError("temporary SMTP failure")
+
+    monkeypatch.setattr(main_module, "send_mail", fail_mail)
+    async with sessions() as db:
+        user = User(username="cardrt", email="retry@example.com", password_hash="hash")
+        plan = Plan(name="Retry Card", slug="retry-card", product_type="card", price_cents=500, cpu=0, memory_mb=0, disk_gb=0)
+        db.add_all([user, plan])
+        await db.flush()
+        await import_card_items(db, plan, "fixed-secret-1111\nunclaimed-secret-2222")
+        order = Order(order_no="VP-CARD-RETRY", user_id=user.id, plan_id=plan.id, amount_cents=500, currency="CNY", product_type="card", status="paid")
+        db.add(order)
+        await db.commit()
+        with pytest.raises(RuntimeError, match="temporary SMTP failure"):
+            await process_card_delivery(db, order.id)
+        await db.refresh(order)
+        assigned = (await db.execute(select(CardItem).where(CardItem.order_id == order.id))).scalar_one()
+        assigned_id = assigned.id
+        assert order.status == "delivery_failed" and reveal_card_secret(assigned) == "fixed-secret-1111"
+
+        async def succeed_mail(db, recipient, subject, body):
+            attempts.append(body)
+
+        monkeypatch.setattr(main_module, "send_mail", succeed_mail)
+        await process_card_delivery(db, order.id)
+        await db.refresh(order)
+        assigned_again = (await db.execute(select(CardItem).where(CardItem.order_id == order.id))).scalar_one()
+        assert order.status == "fulfilled" and assigned_again.id == assigned_id
+        assert all("fixed-secret-1111" in body for body in attempts)
+        assert not any("unclaimed-secret-2222" in body for body in attempts)
+        assert plan.stock == 1
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
