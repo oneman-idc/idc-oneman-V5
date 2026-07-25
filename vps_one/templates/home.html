@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="云主机与数字商品自动支付交付"><title>{{site.site_name}}｜{{site.site_tagline}}</title><link rel="stylesheet" href="/static/app.css"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="云主机与数字商品自动支付交付"><title>{{site.site_name}}｜{{site.site_tagline}}</title><link rel="stylesheet" href="/static/app.css">{% include "_ui_head.html" %}</head>
 <body>
 <header class="nav"><div class="container"><a class="brand" href="/"><b>IDC</b>-ONEMAN</a><nav class="links"><a href="#plans">产品</a><a href="/dashboard">控制台</a>{% if user %}<a href="/account">{{account_user.username}}</a><form method="post" action="/logout"><button class="btn ghost">退出</button></form>{% else %}<a href="/login">登录</a><a class="btn" href="/register">免费注册</a>{% endif %}</nav></div></header>
 <main>

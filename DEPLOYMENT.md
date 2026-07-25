@@ -69,6 +69,13 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/oneman-idc/idc-o
 - 已交付的数字卡密不进入云主机 24 小时自助撤销流程，避免卡密泄露后重复销售。售后需由运营人员核验使用状态后线下处理。
 - 备份或迁移时必须同时保存 `.env` 中的 `MASTER_KEY` 和 `SECRET_KEY`：前者用于解密库存，后者用于卡密去重指纹；任一密钥丢失都会影响现有库存维护。
 
+### 界面模板、语言与明暗模式
+
+- 全部公开页、客户中心和管理后台右上角提供统一的界面设置入口，并在浏览器本地保存选择。
+- `DEFAULT` 是紧凑的运营 Dashboard 风格；`NEW SKIN` 使用 Neumorphism 双向柔和阴影；`GLASS UI` 使用半透明层与背景模糊。
+- 三套模板均支持跟随系统、白天、黑夜三种明暗模式，并可即时切换中文或 English；套餐名称、订单号、节点地址等业务数据保持原文。
+- 共享实现位于 `vps_one/static/themes.css` 和 `vps_one/static/ui.js`，新增 Jinja 页面时在 `app.css` 后引入 `vps_one/templates/_ui_head.html` 即可继承全部能力。
+
 ## 4. 运维命令
 
 在安装目录执行：
