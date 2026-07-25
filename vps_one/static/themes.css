@@ -1,0 +1,527 @@
+html[data-skin] {
+  --ui-bg: #f4f6f8;
+  --ui-panel: #ffffff;
+  --ui-panel-2: #f7f9fb;
+  --ui-text: #172033;
+  --ui-muted: #68758a;
+  --ui-line: #dfe5ec;
+  --ui-accent: #e85f0b;
+  --ui-accent-contrast: #ffffff;
+  --ui-sidebar: #172033;
+  --ui-sidebar-text: #ffffff;
+  --ui-success: #16794b;
+  --ui-danger: #b42318;
+  --ui-warning: #9a5b00;
+  --ui-shadow: 0 6px 20px rgba(23, 32, 51, .07);
+  --ui-shadow-raised: 0 14px 38px rgba(23, 32, 51, .12);
+  color-scheme: light;
+  letter-spacing: 0;
+}
+
+html[data-skin][data-color="dark"] {
+  --ui-bg: #11161f;
+  --ui-panel: #1a2230;
+  --ui-panel-2: #151c27;
+  --ui-text: #edf2f7;
+  --ui-muted: #a7b1c0;
+  --ui-line: #303b4b;
+  --ui-accent: #ff8a3d;
+  --ui-accent-contrast: #171b22;
+  --ui-sidebar: #0c1119;
+  --ui-sidebar-text: #f6f8fb;
+  --ui-success: #5bc493;
+  --ui-danger: #ff7b72;
+  --ui-warning: #efb55f;
+  --ui-shadow: 0 8px 24px rgba(0, 0, 0, .24);
+  --ui-shadow-raised: 0 18px 44px rgba(0, 0, 0, .34);
+  color-scheme: dark;
+}
+
+html[data-skin="newskin"] {
+  --ui-bg: #e8edf3;
+  --ui-panel: #e8edf3;
+  --ui-panel-2: #e1e7ee;
+  --ui-text: #243044;
+  --ui-muted: #657186;
+  --ui-line: rgba(116, 130, 150, .22);
+  --ui-accent: #df5745;
+  --ui-accent-contrast: #ffffff;
+  --ui-sidebar: #e8edf3;
+  --ui-sidebar-text: #243044;
+  --ui-shadow: 9px 9px 20px #c5cbd2, -9px -9px 20px #ffffff;
+  --ui-shadow-raised: 14px 14px 30px #c2c8cf, -14px -14px 30px #ffffff;
+}
+
+html[data-skin="newskin"][data-color="dark"] {
+  --ui-bg: #252b34;
+  --ui-panel: #252b34;
+  --ui-panel-2: #20262e;
+  --ui-text: #eef3f7;
+  --ui-muted: #a9b3c0;
+  --ui-line: rgba(185, 198, 211, .13);
+  --ui-accent: #f07865;
+  --ui-accent-contrast: #1b2027;
+  --ui-sidebar: #252b34;
+  --ui-sidebar-text: #eef3f7;
+  --ui-shadow: 9px 9px 20px #191e25, -9px -9px 20px #313844;
+  --ui-shadow-raised: 14px 14px 28px #171b21, -14px -14px 28px #333b47;
+}
+
+html[data-skin="glass"] {
+  --ui-bg: #dce8ec;
+  --ui-panel: rgba(255, 255, 255, .58);
+  --ui-panel-2: rgba(245, 251, 252, .48);
+  --ui-text: #132435;
+  --ui-muted: #586b7d;
+  --ui-line: rgba(255, 255, 255, .68);
+  --ui-accent: #087f8c;
+  --ui-accent-contrast: #ffffff;
+  --ui-sidebar: rgba(20, 41, 54, .82);
+  --ui-sidebar-text: #f4fbfc;
+  --ui-shadow: 0 10px 28px rgba(32, 68, 82, .13);
+  --ui-shadow-raised: 0 18px 46px rgba(32, 68, 82, .2);
+}
+
+html[data-skin="glass"][data-color="dark"] {
+  --ui-bg: #101820;
+  --ui-panel: rgba(28, 41, 51, .68);
+  --ui-panel-2: rgba(22, 33, 43, .58);
+  --ui-text: #f0f6f6;
+  --ui-muted: #a7b9bd;
+  --ui-line: rgba(206, 236, 236, .17);
+  --ui-accent: #4cc9bd;
+  --ui-accent-contrast: #0e2426;
+  --ui-sidebar: rgba(8, 17, 24, .82);
+  --ui-sidebar-text: #f0f6f6;
+  --ui-shadow: 0 12px 32px rgba(0, 0, 0, .28);
+  --ui-shadow-raised: 0 20px 52px rgba(0, 0, 0, .38);
+}
+
+html[data-skin] *,
+html[data-skin] *::before,
+html[data-skin] *::after {
+  letter-spacing: 0;
+}
+
+html[data-skin] body,
+html[data-skin] .account-main {
+  min-height: 100vh;
+  background: var(--ui-bg);
+  color: var(--ui-text);
+}
+
+html[data-skin] body,
+html[data-skin] .nav,
+html[data-skin] .card,
+html[data-skin] .table-wrap,
+html[data-skin] input,
+html[data-skin] textarea,
+html[data-skin] select,
+html[data-skin] button {
+  transition: background-color .18s ease, border-color .18s ease, color .18s ease, box-shadow .18s ease;
+}
+
+html[data-skin] .hero h1 {
+  font-size: 52px;
+  letter-spacing: 0;
+}
+
+html[data-skin] .hero-grid {
+  grid-template-columns: 1fr;
+  gap: 24px;
+}
+
+html[data-skin] .hero-panel {
+  display: none;
+}
+
+html[data-skin] .hero {
+  padding: 46px 0 38px;
+  background: var(--ui-panel);
+  border-bottom: 1px solid var(--ui-line);
+}
+
+html[data-skin] .nav,
+html[data-skin] footer,
+html[data-skin] .wallet-band {
+  background: var(--ui-panel);
+  color: var(--ui-text);
+  border-color: var(--ui-line);
+}
+
+html[data-skin] .nav {
+  height: 64px;
+  box-shadow: 0 1px 0 var(--ui-line);
+}
+
+html[data-skin] .card,
+html[data-skin] .table-wrap,
+html[data-skin] .empty,
+html[data-skin] .order-row,
+html[data-skin] .host-facts > div,
+html[data-skin] .instance-information,
+html[data-skin] .summary-facts,
+html[data-skin] .summary-facts > div,
+html[data-skin] .order-meta div,
+html[data-skin] .refund-state,
+html[data-skin] .card-delivery-state,
+html[data-skin] .detail-grid form {
+  background: var(--ui-panel);
+  color: var(--ui-text);
+  border-color: var(--ui-line);
+  border-radius: 8px;
+}
+
+html[data-skin] .card,
+html[data-skin] .table-wrap {
+  box-shadow: var(--ui-shadow);
+}
+
+html[data-skin] .summary-facts,
+html[data-skin] .instance-information,
+html[data-skin] .host-facts > div,
+html[data-skin] .card-delivery-state,
+html[data-skin] .order-meta div,
+html[data-skin] .detail-grid form {
+  background: var(--ui-panel-2);
+}
+
+html[data-skin] .summary-facts {
+  background: var(--ui-line);
+}
+
+html[data-skin] .summary-facts > div {
+  background: var(--ui-panel-2);
+}
+
+html[data-skin] input,
+html[data-skin] textarea,
+html[data-skin] select {
+  background: var(--ui-panel);
+  color: var(--ui-text);
+  border-color: var(--ui-line);
+  border-radius: 6px;
+}
+
+html[data-skin] input::placeholder,
+html[data-skin] textarea::placeholder {
+  color: var(--ui-muted);
+  opacity: .8;
+}
+
+html[data-skin] input:focus,
+html[data-skin] textarea:focus,
+html[data-skin] select:focus,
+html[data-skin] button:focus-visible,
+html[data-skin] a:focus-visible {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 2px;
+}
+
+html[data-skin] .btn {
+  min-height: 38px;
+  border-color: var(--ui-accent);
+  border-radius: 6px;
+  background: var(--ui-accent);
+  color: var(--ui-accent-contrast);
+  white-space: normal;
+  text-align: center;
+}
+
+html[data-skin] .btn.ghost,
+html[data-skin] .btn.secondary {
+  background: var(--ui-panel);
+  color: var(--ui-text);
+  border-color: var(--ui-line);
+}
+
+html[data-skin] .text-link,
+html[data-skin] .eyebrow,
+html[data-skin] .brand b {
+  color: var(--ui-accent);
+}
+
+html[data-skin] .muted,
+html[data-skin] .section-head p,
+html[data-skin] .hero p,
+html[data-skin] .sync-note,
+html[data-skin] th,
+html[data-skin] dt,
+html[data-skin] small {
+  color: var(--ui-muted);
+}
+
+html[data-skin] th,
+html[data-skin] td,
+html[data-skin] details,
+html[data-skin] .account-orders,
+html[data-skin] .account-order,
+html[data-skin] .wallet-actions,
+html[data-skin] .instance-details {
+  border-color: var(--ui-line);
+}
+
+html[data-skin] .status {
+  border-color: var(--ui-line);
+  background: var(--ui-panel-2);
+  color: var(--ui-success);
+}
+
+html[data-skin] .status.danger,
+html[data-skin] .danger,
+html[data-skin] .danger-text,
+html[data-skin] .error-cell {
+  color: var(--ui-danger);
+}
+
+html[data-skin] .alert,
+html[data-skin] .notice {
+  border: 1px solid var(--ui-line);
+  border-radius: 6px;
+  background: var(--ui-panel-2);
+  color: var(--ui-text);
+}
+
+html[data-skin] .sidebar {
+  background: var(--ui-sidebar);
+  color: var(--ui-sidebar-text);
+}
+
+html[data-skin] .sidebar nav a {
+  color: color-mix(in srgb, var(--ui-sidebar-text) 76%, transparent);
+}
+
+html[data-skin] .sidebar nav a:hover,
+html[data-skin] .sidebar nav a.active {
+  background: color-mix(in srgb, var(--ui-accent) 24%, transparent);
+  color: var(--ui-sidebar-text);
+}
+
+html[data-skin] .content {
+  background: transparent;
+}
+
+html[data-skin] .account-link,
+html[data-skin] .account-name {
+  background: var(--ui-panel);
+  color: var(--ui-text);
+  border-color: var(--ui-line);
+}
+
+html[data-skin="newskin"] .card,
+html[data-skin="newskin"] .table-wrap,
+html[data-skin="newskin"] .empty,
+html[data-skin="newskin"] .auth,
+html[data-skin="newskin"] .order-row,
+html[data-skin="newskin"] .ui-preferences-panel {
+  border-color: transparent;
+  box-shadow: var(--ui-shadow);
+}
+
+html[data-skin="newskin"] input,
+html[data-skin="newskin"] textarea,
+html[data-skin="newskin"] select,
+html[data-skin="newskin"] .card-delivery-state,
+html[data-skin="newskin"] .instance-information,
+html[data-skin="newskin"] .host-facts > div {
+  border-color: transparent;
+  box-shadow: inset 4px 4px 9px color-mix(in srgb, var(--ui-text) 14%, transparent), inset -4px -4px 9px color-mix(in srgb, var(--ui-panel) 78%, white);
+}
+
+html[data-skin="newskin"] .btn {
+  box-shadow: 4px 4px 9px color-mix(in srgb, var(--ui-text) 20%, transparent), -4px -4px 9px color-mix(in srgb, var(--ui-panel) 72%, white);
+}
+
+html[data-skin="newskin"] .btn:active,
+html[data-skin="newskin"] .ui-segment button[aria-pressed="true"] {
+  box-shadow: inset 3px 3px 7px color-mix(in srgb, var(--ui-text) 20%, transparent), inset -3px -3px 7px color-mix(in srgb, var(--ui-panel) 74%, white);
+}
+
+html[data-skin="newskin"] .sidebar nav a:hover,
+html[data-skin="newskin"] .sidebar nav a.active {
+  background: var(--ui-panel);
+  color: var(--ui-accent);
+  box-shadow: inset 3px 3px 7px color-mix(in srgb, var(--ui-text) 17%, transparent), inset -3px -3px 7px color-mix(in srgb, var(--ui-panel) 74%, white);
+}
+
+html[data-skin="glass"] body,
+html[data-skin="glass"] .account-main {
+  background-color: var(--ui-bg);
+}
+
+html[data-skin="glass"] .nav,
+html[data-skin="glass"] .hero,
+html[data-skin="glass"] footer,
+html[data-skin="glass"] .wallet-band,
+html[data-skin="glass"] .card,
+html[data-skin="glass"] .table-wrap,
+html[data-skin="glass"] .empty,
+html[data-skin="glass"] .order-row,
+html[data-skin="glass"] .ui-preferences-panel {
+  background: var(--ui-panel);
+  backdrop-filter: blur(20px) saturate(125%);
+  -webkit-backdrop-filter: blur(20px) saturate(125%);
+  border: 1px solid var(--ui-line);
+  box-shadow: var(--ui-shadow);
+}
+
+html[data-skin="glass"] input,
+html[data-skin="glass"] textarea,
+html[data-skin="glass"] select,
+html[data-skin="glass"] .summary-facts > div,
+html[data-skin="glass"] .instance-information,
+html[data-skin="glass"] .host-facts > div,
+html[data-skin="glass"] .card-delivery-state,
+html[data-skin="glass"] .order-meta div {
+  background: var(--ui-panel-2);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.ui-preferences {
+  position: relative;
+  z-index: 120;
+  flex: 0 0 auto;
+}
+
+.ui-preferences.ui-preferences-floating {
+  position: fixed;
+  top: 14px;
+  right: 16px;
+  z-index: 120;
+}
+
+.ui-settings-trigger,
+.ui-panel-close {
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid var(--ui-line);
+  border-radius: 6px;
+  background: var(--ui-panel);
+  color: var(--ui-text);
+  cursor: pointer;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.ui-settings-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+}
+
+.ui-settings-trigger[aria-expanded="true"] {
+  border-color: var(--ui-accent);
+  color: var(--ui-accent);
+}
+
+.ui-preferences-panel {
+  position: fixed;
+  top: 58px;
+  right: 16px;
+  width: min(320px, calc(100vw - 24px));
+  padding: 16px;
+  border: 1px solid var(--ui-line);
+  border-radius: 8px;
+  background: var(--ui-panel);
+  color: var(--ui-text);
+  box-shadow: var(--ui-shadow-raised);
+}
+
+.ui-preferences-panel[hidden] {
+  display: none !important;
+}
+
+.ui-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.ui-panel-head strong {
+  font-size: 15px;
+}
+
+.ui-panel-close {
+  width: 30px;
+  height: 30px;
+  font-size: 20px;
+}
+
+.ui-setting {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.ui-setting > span {
+  color: var(--ui-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ui-segment {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--ui-line);
+  border-radius: 6px;
+  background: var(--ui-panel-2);
+}
+
+.ui-segment button {
+  min-width: 0;
+  min-height: 34px;
+  padding: 6px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ui-muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.25;
+  white-space: normal;
+}
+
+.ui-segment button[aria-pressed="true"] {
+  border-color: var(--ui-line);
+  background: var(--ui-panel);
+  color: var(--ui-accent);
+  box-shadow: 0 2px 6px rgba(23, 32, 51, .08);
+}
+
+@media (max-width: 640px) {
+  html[data-skin] .hero h1 {
+    font-size: 36px;
+  }
+
+  html[data-skin] .hero {
+    padding: 34px 0 28px;
+  }
+
+  .ui-preferences-panel {
+    top: 56px;
+    right: 12px;
+  }
+
+  .ui-preferences.ui-preferences-floating {
+    top: 10px;
+    right: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html[data-skin] *,
+  html[data-skin] *::before,
+  html[data-skin] *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
+}
