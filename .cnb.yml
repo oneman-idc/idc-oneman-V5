@@ -6,7 +6,7 @@ $:
       stages:
         - name: install-and-test
           script: |
-            python -m pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt pytest pytest-asyncio
+            python -m pip install -r requirements.txt pytest pytest-asyncio
             PYTHONPATH=. pytest -q
   api_trigger:
     - name: python-tests
@@ -15,5 +15,5 @@ $:
       stages:
         - name: install-and-test
           script: |
-            python -m pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt pytest pytest-asyncio
+            python -m pip install -r requirements.txt pytest pytest-asyncio
             PYTHONPATH=. pytest -q
