@@ -1,0 +1,29 @@
+.expiry-summary { display:flex; flex-direction:column; align-items:flex-start; gap:5px; }
+.expiry-summary dd { width:100%; }
+.renewal-warning { color:#b45309; font-weight:750; }
+.renewal-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:8px; }
+.renewal-actions input { display:none; }
+.renewal-state { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:12px 0; padding:11px 12px; border-left:3px solid var(--brand); background:#fff7ed; }
+.renewal-state code { margin-right:auto; }
+.renewal-state small { width:100%; }
+.renewal-management { display:grid; gap:12px; margin:14px 0; padding:14px; background:#fff; border:1px solid var(--line); border-radius:8px; }
+.renewal-management > form:first-child { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.renewal-management > form:first-child small { color:var(--muted); }
+.auto-renew-toggle { display:inline-flex; align-items:center; gap:8px; padding:7px 11px; border:1px solid var(--line); border-radius:999px; background:#fff; color:var(--muted); font-weight:750; cursor:pointer; }
+.auto-renew-toggle span { position:relative; width:30px; height:16px; border-radius:999px; background:#94a3b8; }
+.auto-renew-toggle span::after { content:""; position:absolute; top:2px; left:2px; width:12px; height:12px; border-radius:50%; background:#fff; transition:.15s; }
+.auto-renew-toggle.is-on { color:#166534; border-color:#86efac; background:#f0fdf4; }
+.auto-renew-toggle.is-on span { background:#22c55e; }
+.auto-renew-toggle.is-on span::after { transform:translateX(14px); }
+.renewal-history { margin-top:0; padding-top:10px; }
+.renewal-history ul { display:grid; gap:6px; margin:10px 0 0; padding:0; list-style:none; }
+.renewal-history li { display:grid; grid-template-columns:1fr auto auto; gap:10px; padding:7px 9px; background:var(--bg); border-radius:5px; }
+.renewal-history time { color:var(--muted); }
+.repurchase-form { display:grid; gap:8px; margin-top:12px; padding:12px; border:1px solid var(--line); border-radius:7px; background:#fff; }
+.order-meta { grid-template-columns:repeat(5,minmax(0,1fr)); }
+@media(max-width:760px) {
+  .renewal-actions { align-items:stretch; }
+  .renewal-actions .btn { flex:1; }
+  .renewal-history li { grid-template-columns:1fr; }
+  .order-meta { grid-template-columns:1fr 1fr; }
+}

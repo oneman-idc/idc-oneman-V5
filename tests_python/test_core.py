@@ -10,13 +10,13 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from vps_one.database import backfill_accounts, migrate, migrate_instance_identity, normalize_plan_nat_port_counts
-from vps_one.main import app, consume_vnc_session, containers_by_node, create_vnc_session, decode_clicd_ref, encode_clicd_ref, encrypted_access, instance_access, instance_card, instance_mail_text, node_for_instance, node_from_ref, order_job_kind, parse_clicd_nodes, parse_plan_image_choice, plan_image_choice, process_card_delivery, process_refund
-from vps_one.models import Base, CardItem, Instance, Job, Order, Plan, RefundRequest, Setting, User, WalletEntry, WalletTopUp
+from vps_one.main import active_renewal, app, consume_vnc_session, containers_by_node, create_vnc_session, create_wallet_renewal, decode_clicd_ref, encode_clicd_ref, encrypted_access, instance_access, instance_card, instance_mail_text, node_for_instance, node_from_ref, order_job_kind, parse_clicd_nodes, parse_plan_image_choice, plan_image_choice, process_card_delivery, process_refund, process_renewal, process_renewal_mail, process_renewal_maintenance, renewal_expiry
+from vps_one.models import Base, CardItem, Instance, Job, Order, Plan, RefundRequest, Renewal, Setting, User, WalletEntry, WalletTopUp
 from vps_one.security import confirmation_code, confirmation_hash, csrf_token, decrypt, encrypt, hash_password, session_token, valid_confirmation, verify_password
 from datetime import datetime, timedelta, timezone
 from vps_one.services.accounts import ensure_wallet, generate_login_name, parse_money_cents, payment_amount_cents, post_wallet_entry, refund_eligible
 from vps_one.services.cards import card_fingerprint, card_lines, import_card_items, mask_card_secret, reserve_card_item, reveal_card_secret
-from vps_one.services.clicd import CLICD, CLICDError, container_details, container_items, container_status, enabled_image_items, expiration_date, extract_access, normalize_virtualization, plan_payload, reset_password_value
+from vps_one.services.clicd import CLICD, CLICDError, container_details, container_items, container_status, enabled_image_items, expiration_date, expiration_datetime, extract_access, normalize_virtualization, plan_payload, reset_password_value
 from vps_one.services.hashpay import HashPay
 
 
@@ -154,6 +154,8 @@ def test_clicd_action_routes_do_not_shadow_specialized_routes():
     assert "/instances/{instance_id}/port" in paths
     assert "/instances/{instance_id}/vnc-session" in paths
     assert "/instances/{instance_id}/vnc" in paths
+    assert "/instances/{instance_id}/renew" in paths
+    assert "/account/orders/{order_id}/auto-renew" in paths
     assert "/account" in paths
     assert "/account/wallet/topups" in paths
     assert "/account/orders/{order_id}/card-email" in paths
@@ -256,8 +258,12 @@ async def test_card_product_migration_adds_types_and_inventory_table():
         plan_type = await conn.scalar(text("SELECT product_type FROM plans WHERE id=1"))
         order_type = await conn.scalar(text("SELECT product_type FROM orders WHERE id=1"))
         card_columns = {row[1] for row in await conn.execute(text("PRAGMA table_info(card_items)"))}
+        renewal_columns = {row[1] for row in await conn.execute(text("PRAGMA table_info(renewals)"))}
+        auto_renew = await conn.scalar(text("SELECT auto_renew FROM orders WHERE id=1"))
         assert plan_type == order_type == "cloud"
+        assert auto_renew == 1
         assert {"secret_ciphertext", "secret_fingerprint", "masked_value", "email_sent_at"}.issubset(card_columns)
+        assert {"renewal_no", "instance_id", "new_expires_at", "email_sent_at"}.issubset(renewal_columns)
     await engine.dispose()
 
 
@@ -684,6 +690,153 @@ def test_hashpay_encrypted_callback():
     wrapped = private.public_key().encrypt(aes_key, padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
     envelope = {"alg": "RSA-OAEP-256+A256GCM", "key": base64.b64encode(wrapped).decode(), "iv": base64.b64encode(iv).decode(), "data": base64.b64encode(encrypted).decode()}
     assert HashPay("", "", pem).decrypt_callback(envelope)["merchantNo"] == "VP1"
+
+
+@pytest.mark.asyncio
+async def test_card_orders_reject_renewal_and_auto_renew(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with sessions() as db:
+        user = User(username="norenw", email="card-no-renew@example.com", password_hash="hash")
+        plan = Plan(name="Digital Code", slug="digital-no-renew", product_type="card", price_cents=1000, cpu=0, memory_mb=0, disk_gb=0)
+        db.add_all([user, plan])
+        await db.flush()
+        order = Order(order_no="VP-CARD-NO-RENEW", user_id=user.id, plan_id=plan.id, amount_cents=1000, currency="CNY", product_type="card", status="fulfilled", auto_renew=False)
+        db.add(order)
+        await db.flush()
+        instance = Instance(user_id=user.id, order_id=order.id, plan_id=plan.id, clicd_id="should-not-call", name="CARD", status="running", expires_at=datetime.utcnow() + timedelta(days=1))
+        db.add(instance)
+        await db.commit()
+        cookie = session_token(user.id, False)
+        request = main_module.Request({"type": "http", "method": "POST", "path": "/account", "headers": [(b"cookie", f"vps_session={cookie}".encode())], "client": ("127.0.0.1", 12345)})
+        with pytest.raises(main_module.HTTPException) as auto_error:
+            await main_module.toggle_auto_renew(order.id, request, csrf_token(cookie), True, db)
+        assert auto_error.value.status_code == 409
+        with pytest.raises(main_module.HTTPException) as renewal_error:
+            await main_module.renew_instance(instance.id, request, csrf_token(cookie), "wallet", "account", db)
+        assert renewal_error.value.status_code == 409
+        assert await db.scalar(select(func.count(Renewal.id))) == 0
+    await engine.dispose()
+
+
+def test_renewal_expiry_and_remote_expiration_normalization():
+    now = datetime(2027, 1, 10, 12, 0, 0)
+    future = datetime(2027, 1, 20, 12, 0, 0)
+    assert renewal_expiry(future, 2, now) == future + timedelta(days=60)
+    assert renewal_expiry(datetime(2027, 1, 1), 1, now) == now + timedelta(days=30)
+    assert expiration_datetime("2027-02-03T04:05:06Z") == datetime(2027, 2, 3, 4, 5, 6)
+    assert expiration_datetime("invalid") is None
+    assert container_details({"id": "ct-1", "expires_at": "2027-02-03"})["expires_at"] == datetime(2027, 2, 3)
+
+
+@pytest.mark.asyncio
+async def test_wallet_renewal_updates_clicd_local_order_and_email(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    updated = []
+    sent = []
+
+    class Client:
+        async def update_expiry(self, instance_id, expires_at):
+            updated.append((instance_id, expires_at))
+
+    class Node:
+        def client(self):
+            return Client()
+
+    async def fake_node_for_instance(db, instance, nodes=None):
+        return Node()
+
+    async def capture_mail(db, recipient, subject, body):
+        sent.append((recipient, subject, body))
+
+    monkeypatch.setattr(main_module, "node_for_instance", fake_node_for_instance)
+    monkeypatch.setattr(main_module, "send_mail", capture_mail)
+    async with sessions() as db:
+        user = User(username="reneww", email="renew@example.com", password_hash="hash")
+        plan = Plan(name="Renewable KVM", slug="renewable-kvm", product_type="cloud", price_cents=2500, months=2, cpu=2, memory_mb=1024, disk_gb=20)
+        db.add_all([user, plan])
+        await db.flush()
+        order = Order(order_no="VP-RENEW-WALLET", user_id=user.id, plan_id=plan.id, amount_cents=2500, currency="CNY", product_type="cloud", status="fulfilled", paid_at=datetime.utcnow(), fulfilled_at=datetime.utcnow())
+        db.add(order)
+        await db.flush()
+        original_expiry = datetime.utcnow() + timedelta(days=5)
+        instance = Instance(user_id=user.id, order_id=order.id, plan_id=plan.id, clicd_id="ct-renew", clicd_node="https://panel.example.com", name="VPS-RENEW", status="running", expires_at=original_expiry)
+        db.add(instance)
+        wallet = await ensure_wallet(db, user.id)
+        wallet.balance_cents = 5000
+        await db.commit()
+        renewal = await create_wallet_renewal(db, order, instance, plan)
+        await db.commit()
+        assert renewal.status == "paid"
+        assert renewal.new_expires_at == original_expiry + timedelta(days=60)
+        await db.refresh(wallet)
+        assert wallet.balance_cents == 2500
+        assert await active_renewal(db, instance.id) is renewal
+        await process_renewal(db, renewal.id)
+        await db.refresh(renewal)
+        await db.refresh(instance)
+        assert renewal.status == "fulfilled"
+        assert instance.expires_at == renewal.new_expires_at
+        assert updated == [("ct-renew", renewal.new_expires_at)]
+        mail_job = (await db.execute(select(Job).where(Job.kind == "mail_renewal", Job.ref_id == renewal.id))).scalar_one()
+        await process_renewal_mail(db, mail_job.ref_id)
+        await db.refresh(renewal)
+        assert renewal.email_sent_at is not None
+        assert len(sent) == 1 and "续期成功" in sent[0][1] and renewal.renewal_no in sent[0][2]
+        await process_renewal(db, renewal.id)
+        await process_renewal_mail(db, renewal.id)
+        assert len(updated) == len(sent) == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_renewal_maintenance_reminds_and_uses_wallet_once(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sent = []
+
+    async def capture_mail(db, recipient, subject, body):
+        sent.append((recipient, subject))
+
+    monkeypatch.setattr(main_module, "send_mail", capture_mail)
+    now = datetime(2027, 3, 1, 12, 0, 0)
+    async with sessions() as db:
+        plan = Plan(name="Monthly", slug="monthly-renew", product_type="cloud", price_cents=2000, months=1, cpu=1, memory_mb=512, disk_gb=10)
+        rich = User(username="autorn", email="auto@example.com", password_hash="hash")
+        low = User(username="lowbal", email="low@example.com", password_hash="hash")
+        db.add_all([plan, rich, low])
+        await db.flush()
+        rich_order = Order(order_no="VP-AUTO-RICH", user_id=rich.id, plan_id=plan.id, amount_cents=2000, currency="CNY", product_type="cloud", status="fulfilled", auto_renew=True)
+        low_order = Order(order_no="VP-AUTO-LOW", user_id=low.id, plan_id=plan.id, amount_cents=2000, currency="CNY", product_type="cloud", status="fulfilled", auto_renew=True)
+        db.add_all([rich_order, low_order])
+        await db.flush()
+        expiry = now + timedelta(hours=12)
+        db.add_all([
+            Instance(user_id=rich.id, order_id=rich_order.id, plan_id=plan.id, clicd_id="ct-rich", clicd_node="https://panel.example.com", name="RICH", status="running", expires_at=expiry),
+            Instance(user_id=low.id, order_id=low_order.id, plan_id=plan.id, clicd_id="ct-low", clicd_node="https://panel.example.com", name="LOW", status="running", expires_at=expiry),
+        ])
+        rich_wallet = await ensure_wallet(db, rich.id)
+        rich_wallet.balance_cents = 5000
+        await ensure_wallet(db, low.id)
+        await db.commit()
+        counts = await process_renewal_maintenance(db, now)
+        assert counts == {"reminders": 2, "auto_renewals": 1, "balance_notices": 1}
+        renewals = (await db.execute(select(Renewal))).scalars().all()
+        assert len(renewals) == 1 and renewals[0].source == "auto" and renewals[0].status == "paid"
+        await db.refresh(rich_wallet)
+        assert rich_wallet.balance_cents == 3000
+        assert len(sent) == 3
+        assert sum("余额不足" in subject for _, subject in sent) == 1
+        assert await process_renewal_maintenance(db, now) == {"reminders": 0, "auto_renewals": 0, "balance_notices": 0}
+        assert len(sent) == 3
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

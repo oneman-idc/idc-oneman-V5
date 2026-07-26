@@ -23,7 +23,7 @@ from websockets.asyncio.client import connect as websocket_connect
 
 from .config import settings
 from .database import SessionLocal, init_db, session, write_lock
-from .models import Audit, CardItem, Instance, Job, Order, PaymentEvent, Plan, RefundRequest, User, WalletEntry, WalletTopUp
+from .models import Audit, CardItem, Instance, Job, Order, PaymentEvent, Plan, RefundRequest, Renewal, User, WalletEntry, WalletTopUp
 from .security import confirmation_code, confirmation_hash, csrf_token, decrypt, encrypt, hash_password, read_session, session_token, valid_confirmation, valid_csrf, verify_password
 from .services.accounts import ensure_wallet, generate_login_name, parse_money_cents, payment_amount_cents, post_wallet_entry, refund_deadline, refund_eligible
 from .services.cards import import_card_items, reserve_card_item, reveal_card_secret
@@ -41,6 +41,11 @@ VNC_SESSION_TTL = 55
 REFUND_CONFIRMATION_TTL = timedelta(minutes=15)
 REFUND_MAX_REQUESTS_24H = 5
 REFUND_ACTIVE_STATUSES = {"confirmation_pending", "confirmation_locked", "email_failed", "expired", "pending_review", "approved", "processing", "processing_failed"}
+RENEWAL_ACTIVE_STATUSES = {"pending", "payment_pending", "paid", "processing"}
+RENEWAL_REMINDER_WINDOW = timedelta(days=7)
+AUTO_RENEW_WINDOW = timedelta(hours=24)
+AUTO_RENEW_GRACE = timedelta(hours=24)
+MAINTENANCE_INTERVAL_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -283,6 +288,13 @@ def order_status_label(status: str) -> str:
     return {"pending": "待支付", "payment_pending": "待支付", "payment_error": "支付失败", "paid": "已支付", "provisioning": "交付中", "delivering": "发卡中", "delivery_failed": "发卡异常", "fulfilled": "已完成", "refunded": "已退款"}.get(status, status)
 
 
+def renewal_status_label(status: str) -> str:
+    return {
+        "pending": "待创建支付", "payment_pending": "待支付", "payment_error": "支付创建失败",
+        "paid": "已支付", "processing": "正在同步到期时间", "fulfilled": "续期成功",
+    }.get(status, status)
+
+
 def refund_status_label(status: str) -> str:
     return {
         "confirmation_pending": "待邮箱确认", "confirmation_locked": "验证码已锁定", "email_failed": "邮件发送失败",
@@ -312,15 +324,25 @@ def order_job_kind(order: Order) -> str:
     return "deliver_card" if (order.product_type or "cloud") == "card" else "provision"
 
 
-def instance_card(instance: Instance, order: Order, plan: Plan, remote: dict | None = None) -> dict:
+def instance_card(instance: Instance, order: Order, plan: Plan, remote: dict | None = None, renewal: Renewal | None = None) -> dict:
     details = container_details(remote or {})
     access = instance_access(instance)
     package = snapshot_data(order, plan)
     virtualization = details.get("virtualization") or normalize_virtualization(package.get("virtualization")) or normalize_virtualization(plan.virtualization)
+    now = datetime.utcnow()
+    expires_at = instance.expires_at
+    days_remaining = (expires_at.date() - now.date()).days if expires_at else None
     return {
         "instance": instance,
         "order": order,
         "package": package,
+        "renewal": renewal,
+        "renewal_price_cents": plan.price_cents,
+        "renewal_currency": plan.currency,
+        "renewal_months": max(1, int(plan.months or 1)),
+        "expired": bool(expires_at and expires_at <= now),
+        "expires_soon": bool(expires_at and now < expires_at <= now + RENEWAL_REMINDER_WINDOW),
+        "days_remaining": days_remaining,
         "operating_system": details.get("operating_system") or package.get("clicd_image") or "未返回",
         "virtualization": virtualization,
         "is_kvm": virtualization == "kvm",
@@ -384,6 +406,45 @@ async def hashpay_checkout(db, merchant_no: str, amount_cents: int, currency: st
     return str(checkout_url), hashpay_id
 
 
+def renewal_expiry(expires_at: datetime | None, months: int, now: datetime | None = None) -> datetime:
+    current = now or datetime.utcnow()
+    base = expires_at if expires_at and expires_at > current else current
+    return base + timedelta(days=30 * max(1, int(months or 1)))
+
+
+async def active_renewal(db, instance_id: int) -> Renewal | None:
+    return (await db.execute(
+        select(Renewal).where(Renewal.instance_id == instance_id, Renewal.status.in_(RENEWAL_ACTIVE_STATUSES)).order_by(Renewal.id.desc()).limit(1)
+    )).scalar_one_or_none()
+
+
+def renewal_record(order: Order, instance: Instance, plan: Plan, payment_method: str, source: str, now: datetime | None = None) -> Renewal:
+    current = now or datetime.utcnow()
+    previous = instance.expires_at or current
+    return Renewal(
+        renewal_no="RN" + current.strftime("%Y%m%d%H%M%S") + secrets.token_hex(3).upper(),
+        order_id=order.id, instance_id=instance.id, user_id=order.user_id,
+        amount_cents=plan.price_cents, currency=plan.currency, months=max(1, int(plan.months or 1)),
+        payment_method=payment_method, source=source, previous_expires_at=previous,
+        new_expires_at=renewal_expiry(previous, plan.months, current),
+    )
+
+
+async def create_wallet_renewal(db, order: Order, instance: Instance, plan: Plan, source: str = "manual", now: datetime | None = None) -> Renewal:
+    if await active_renewal(db, instance.id):
+        raise ValueError("该云主机已有续期正在处理")
+    wallet = await ensure_wallet(db, order.user_id, plan.currency)
+    if wallet.currency != plan.currency:
+        raise ValueError("钱包币种与套餐币种不一致")
+    renewal = renewal_record(order, instance, plan, "wallet", source, now)
+    db.add(renewal)
+    await db.flush()
+    await post_wallet_entry(db, wallet, -renewal.amount_cents, "renewal", "renewal", renewal.id, f"续期套餐 {plan.name}")
+    renewal.status, renewal.paid_at = "paid", now or datetime.utcnow()
+    db.add(Job(kind="renew", ref_id=renewal.id))
+    return renewal
+
+
 async def send_refund_confirmation(db, refund: RefundRequest, user: User, order: Order, code: str) -> None:
     expiry = refund.confirmation_expires_at.strftime("%Y-%m-%d %H:%M UTC") if refund.confirmation_expires_at else "15 分钟后"
     await send_mail(
@@ -403,6 +464,28 @@ async def send_card_credentials(db, order: Order, user: User, plan: Plan, item: 
         user.email,
         f"订单 {order.order_no} 卡密已交付",
         f"您购买的数字商品已完成交付。\n\n商品：{package.get('name') or plan.name}\n订单：{order.order_no}\n卡密：{reveal_card_secret(item)}\n{note_section}\n卡密全文仅发送至注册邮箱，请妥善保管并尽快使用。",
+    )
+
+
+async def send_expiry_reminder(db, user: User, order: Order, plan: Plan, instance: Instance) -> None:
+    expiry = instance.expires_at.strftime("%Y-%m-%d %H:%M UTC")
+    await send_mail(
+        db, user.email, f"您的 {instance.name} 将于 7 天内到期",
+        f"您的云主机即将到期。\n\n套餐：{plan.name}\n订单：{order.order_no}\n实例：{instance.name}\n到期时间：{expiry}\n续期费用：{plan.currency} {plan.price_cents / 100:.2f} / {max(1, plan.months)} 个月\n\n请登录 {(await site_url(db))}/dashboard 选择钱包或 HashPay 完成续期。",
+    )
+
+
+async def send_balance_reminder(db, user: User, order: Order, plan: Plan, instance: Instance, balance_cents: int) -> None:
+    await send_mail(
+        db, user.email, f"{instance.name} 自动续费余额不足",
+        f"订单 {order.order_no} 已开启自动续费，但钱包余额不足。\n\n套餐：{plan.name}\n续期费用：{plan.currency} {plan.price_cents / 100:.2f}\n当前余额：{plan.currency} {balance_cents / 100:.2f}\n到期时间：{instance.expires_at.strftime('%Y-%m-%d %H:%M UTC')}\n\n请尽快登录 {(await site_url(db))}/account 在线充值，充值后也可手动续期。",
+    )
+
+
+async def send_renewal_success(db, renewal: Renewal, user: User, order: Order, plan: Plan, instance: Instance) -> None:
+    await send_mail(
+        db, user.email, f"{instance.name} 续期成功",
+        f"您的云主机已续期成功。\n\n套餐：{plan.name}\n订单：{order.order_no}\n续期单：{renewal.renewal_no}\n支付方式：{'钱包' if renewal.payment_method == 'wallet' else 'HashPay'}\n支付金额：{renewal.currency} {renewal.amount_cents / 100:.2f}\n新的到期时间：{renewal.new_expires_at.strftime('%Y-%m-%d %H:%M UTC')}\n\nCLICD 到期时间已经同步更新。",
     )
 
 
@@ -459,6 +542,68 @@ async def process_card_delivery(db, order_id: int, resend: bool = False) -> None
         raise
 
 
+async def process_renewal(db, renewal_id: int) -> None:
+    renewal = await db.get(Renewal, renewal_id)
+    if not renewal or renewal.status == "fulfilled":
+        return
+    if renewal.status not in {"paid", "processing"}:
+        raise RuntimeError("续期单尚未支付")
+    order = await db.get(Order, renewal.order_id)
+    instance = await db.get(Instance, renewal.instance_id)
+    plan = await db.get(Plan, order.plan_id) if order else None
+    if not order or not instance or not plan or order.user_id != renewal.user_id or instance.order_id != order.id:
+        raise RuntimeError("续期单缺少订单、实例或套餐数据")
+    if order.product_type != "cloud" or plan.product_type != "cloud" or order.status != "fulfilled" or instance.status == "deleted" or not instance.clicd_id:
+        raise RuntimeError("该商品不支持续期")
+    renewal.status, renewal.error = "processing", ""
+    await db.commit()
+    try:
+        client = (await node_for_instance(db, instance)).client()
+        await client.update_expiry(instance.clicd_id, renewal.new_expires_at)
+    except Exception as exc:
+        await db.rollback()
+        failed = await db.get(Renewal, renewal_id)
+        if failed and failed.status != "fulfilled":
+            failed.status = "paid"
+            failed.error = str(exc)[:1000]
+            await db.commit()
+        raise
+    async with write_lock:
+        await db.refresh(renewal)
+        await db.refresh(instance)
+        if renewal.status == "fulfilled":
+            return
+        now = datetime.utcnow()
+        if not instance.expires_at or instance.expires_at < renewal.new_expires_at:
+            instance.expires_at = renewal.new_expires_at
+        instance.expiry_notice_for = None
+        instance.balance_notice_for = None
+        renewal.status, renewal.fulfilled_at, renewal.error = "fulfilled", now, ""
+        mail_job = (await db.execute(select(Job).where(Job.kind == "mail_renewal", Job.ref_id == renewal.id))).scalar_one_or_none()
+        if not mail_job:
+            db.add(Job(kind="mail_renewal", ref_id=renewal.id))
+        db.add(Audit(user_id=renewal.user_id, action="renewal.fulfilled", detail=f"{renewal.renewal_no} · {renewal.new_expires_at.isoformat()}"))
+        await db.commit()
+
+
+async def process_renewal_mail(db, renewal_id: int) -> None:
+    renewal = await db.get(Renewal, renewal_id)
+    if not renewal or renewal.email_sent_at:
+        return
+    if renewal.status != "fulfilled":
+        raise RuntimeError("续期尚未完成，暂不能发送成功邮件")
+    order = await db.get(Order, renewal.order_id)
+    instance = await db.get(Instance, renewal.instance_id)
+    user = await db.get(User, renewal.user_id)
+    plan = await db.get(Plan, order.plan_id) if order else None
+    if not order or not instance or not user or not plan:
+        raise RuntimeError("续期邮件缺少关联数据")
+    await send_renewal_success(db, renewal, user, order, plan, instance)
+    renewal.email_sent_at = datetime.utcnow()
+    db.add(Audit(user_id=user.id, action="renewal.email.sent", detail=renewal.renewal_no))
+    await db.commit()
+
+
 async def process_refund(db, refund_id: int):
     refund = await db.get(RefundRequest, refund_id)
     if not refund or refund.status == "completed" or refund.status not in {"approved", "processing", "processing_failed"}:
@@ -495,6 +640,7 @@ async def process_refund(db, refund_id: int):
             refund.refunded_at = refund.refunded_at or now
             refund.completed_at = now
             refund.error = ""
+            order.auto_renew = False
             order.status = "refunded"
             db.add(Audit(user_id=refund.reviewed_by, action="refund.completed", detail=f"{refund.refund_no} · {order.order_no}"))
             await db.commit()
@@ -527,6 +673,10 @@ async def process_job(db, job: Job):
         expiry = instance.expires_at.strftime("%Y-%m-%d") if instance.expires_at else "请登录客户中心查看"
         access = instance_access(instance)
         await send_mail(db, user.email, f"您的 VPS {instance.name} 已交付", f"套餐：{plan.name}\n订单：{order.order_no}\n实例：{instance.name}\n状态：{safe_status_label(instance.status)}\n到期日期：{expiry}\n\nCLICD 管理用户名：{access.get('username') or '未返回'}\n初始密码：{access.get('password') or '未返回'}\n访问码：{access.get('access_code') or '未返回'}\n管理地址：{access.get('management_url') or '请登录客户中心查看'}\n\n以上信息仅发送给订单注册邮箱，请妥善保存并及时修改初始密码。")
+    elif job.kind == "renew":
+        await process_renewal(db, job.ref_id)
+    elif job.kind == "mail_renewal":
+        await process_renewal_mail(db, job.ref_id)
     elif job.kind == "refund":
         await process_refund(db, job.ref_id)
 
@@ -542,6 +692,81 @@ async def recover_stale_jobs(db) -> int:
     if jobs:
         await db.commit()
     return len(jobs)
+
+
+async def process_renewal_maintenance(db, now: datetime | None = None) -> dict[str, int]:
+    current = now or datetime.utcnow()
+    rows = (await db.execute(
+        select(Instance, Order, Plan, User)
+        .join(Order, Order.id == Instance.order_id)
+        .join(Plan, Plan.id == Instance.plan_id)
+        .join(User, User.id == Instance.user_id)
+        .where(
+            Instance.status != "deleted", Instance.expires_at.is_not(None),
+            Instance.expires_at >= current - AUTO_RENEW_GRACE,
+            Instance.expires_at <= current + RENEWAL_REMINDER_WINDOW,
+            Order.status == "fulfilled", Order.product_type == "cloud", Plan.product_type == "cloud",
+        )
+        .order_by(Instance.expires_at, Instance.id)
+    )).all()
+    counts = {"reminders": 0, "auto_renewals": 0, "balance_notices": 0}
+    for instance, order, plan, user in rows:
+        expiry = instance.expires_at
+        if current < expiry <= current + RENEWAL_REMINDER_WINDOW and instance.expiry_notice_for != expiry:
+            try:
+                await send_expiry_reminder(db, user, order, plan, instance)
+            except Exception as exc:
+                logger.warning("实例 %s 到期提醒发送失败：%s", instance.id, exc)
+            else:
+                instance.expiry_notice_for = expiry
+                db.add(Audit(user_id=user.id, action="renewal.reminder.sent", detail=f"{order.order_no} · {expiry.isoformat()}"))
+                await db.commit()
+                counts["reminders"] += 1
+        if not order.auto_renew or not current - AUTO_RENEW_GRACE <= expiry <= current + AUTO_RENEW_WINDOW:
+            continue
+        if await active_renewal(db, instance.id):
+            continue
+        wallet = await ensure_wallet(db, user.id, plan.currency)
+        wallet_sufficient = wallet.currency == plan.currency and wallet.balance_cents >= plan.price_cents
+        if wallet_sufficient:
+            try:
+                async with write_lock:
+                    await db.refresh(order)
+                    await db.refresh(instance)
+                    if await active_renewal(db, instance.id):
+                        continue
+                    renewal = await create_wallet_renewal(db, order, instance, plan, source="auto", now=current)
+                    db.add(Audit(user_id=user.id, action="renewal.auto.charged", detail=renewal.renewal_no))
+                    await db.commit()
+                counts["auto_renewals"] += 1
+            except Exception as exc:
+                await db.rollback()
+                logger.warning("实例 %s 自动续费创建失败：%s", instance.id, exc)
+            continue
+        if instance.balance_notice_for == expiry:
+            continue
+        try:
+            await send_balance_reminder(db, user, order, plan, instance, wallet.balance_cents if wallet.currency == plan.currency else 0)
+        except Exception as exc:
+            logger.warning("实例 %s 余额不足提醒发送失败：%s", instance.id, exc)
+        else:
+            instance.balance_notice_for = expiry
+            db.add(Audit(user_id=user.id, action="renewal.balance_notice.sent", detail=f"{order.order_no} · {expiry.isoformat()}"))
+            await db.commit()
+            counts["balance_notices"] += 1
+    return counts
+
+
+async def maintenance_worker():
+    while True:
+        try:
+            async with SessionLocal() as db:
+                await process_renewal_maintenance(db)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("续费维护任务循环异常")
+        await asyncio.sleep(MAINTENANCE_INTERVAL_SECONDS)
 
 
 async def worker():
@@ -649,9 +874,13 @@ async def provision(db, order_id: int):
 @asynccontextmanager
 async def lifespan(app):
     await init_db()
-    task = asyncio.create_task(worker())
-    yield
-    task.cancel()
+    tasks = [asyncio.create_task(worker()), asyncio.create_task(maintenance_worker())]
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(title="VPS-ONE", lifespan=lifespan)
@@ -768,7 +997,7 @@ async def create_order(request: Request, plan_id: int = Form(), csrf: str = Form
     if not plan or not plan.active or plan.stock == 0 or payment_method not in {"hashpay", "wallet"}:
         raise HTTPException(404, "套餐不可购买")
     order_no = "VP" + datetime.utcnow().strftime("%Y%m%d%H%M%S") + secrets.token_hex(3).upper()
-    order = Order(order_no=order_no, user_id=user["uid"], plan_id=plan.id, plan_snapshot=plan_snapshot(plan), amount_cents=plan.price_cents, currency=plan.currency, product_type=plan.product_type, payment_method=payment_method)
+    order = Order(order_no=order_no, user_id=user["uid"], plan_id=plan.id, plan_snapshot=plan_snapshot(plan), amount_cents=plan.price_cents, currency=plan.currency, product_type=plan.product_type, payment_method=payment_method, auto_renew=plan.product_type == "cloud")
     if payment_method == "wallet":
         try:
             async with write_lock:
@@ -829,8 +1058,9 @@ async def callback(request: Request, db=Depends(session)):
     merchant_no = str(payload.get("merchantNo") or "")
     event_id = str(payload.get("eventId") or payload.get("id") or hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest())
     order = (await db.execute(select(Order).where(Order.order_no == merchant_no))).scalar_one_or_none()
-    topup = (await db.execute(select(WalletTopUp).where(WalletTopUp.topup_no == merchant_no))).scalar_one_or_none() if not order else None
-    target = order or topup
+    renewal = (await db.execute(select(Renewal).where(Renewal.renewal_no == merchant_no))).scalar_one_or_none() if not order else None
+    topup = (await db.execute(select(WalletTopUp).where(WalletTopUp.topup_no == merchant_no))).scalar_one_or_none() if not order and not renewal else None
+    target = order or renewal or topup
     if not target:
         return JSONResponse({"error": "payment reference not found"}, 404)
     async with write_lock:
@@ -859,6 +1089,11 @@ async def callback(request: Request, db=Depends(session)):
                     order.status = "delivery_failed"
                     db.add(Audit(user_id=order.user_id, action="card.stock.shortage", detail=f"{order.order_no} · {exc}"))
             db.add(Job(kind=order_job_kind(order), ref_id=order.id))
+        elif renewal and renewal.status in {"pending", "payment_pending", "payment_error"}:
+            renewal.status, renewal.paid_at, renewal.error = "paid", datetime.utcnow(), ""
+            existing_job = (await db.execute(select(Job).where(Job.kind == "renew", Job.ref_id == renewal.id))).scalar_one_or_none()
+            if not existing_job:
+                db.add(Job(kind="renew", ref_id=renewal.id))
         elif topup and topup.status != "paid":
             wallet = await ensure_wallet(db, topup.user_id, topup.currency)
             await post_wallet_entry(db, wallet, topup.amount_cents, "topup", "topup", topup.id, f"钱包充值 {topup.topup_no}")
@@ -871,6 +1106,7 @@ async def callback(request: Request, db=Depends(session)):
 async def dashboard(request: Request, db=Depends(session)):
     user = guard(request)
     account_user = await db.get(User, user["uid"])
+    wallet = await ensure_wallet(db, user["uid"])
     orders = (await db.execute(select(Order).where(Order.user_id == user["uid"]).order_by(Order.id.desc()).limit(100))).scalars().all()
     instances = (await db.execute(select(Instance).where(Instance.user_id == user["uid"], Instance.status != "deleted").order_by(Instance.id.desc()).limit(100))).scalars().all()
     plans = {plan.id: plan for plan in (await db.execute(select(Plan).where(Plan.id.in_({order.plan_id for order in orders})))).scalars().all()} if orders else {}
@@ -901,6 +1137,8 @@ async def dashboard(request: Request, db=Depends(session)):
                     instance.ssh_port = details["ssh_port"]
                     if details["ssh_password"]:
                         instance.ssh_password = encrypt(details["ssh_password"])
+                    if details.get("expires_at"):
+                        instance.expires_at = details["expires_at"]
                     instance.last_synced_at = datetime.utcnow()
             await db.commit()
             if errors:
@@ -908,9 +1146,14 @@ async def dashboard(request: Request, db=Depends(session)):
         except Exception as exc:
             logger.warning("容器列表同步失败：%s", exc)
     order_by_id = {order.id: order for order in orders}
-    cards = [instance_card(instance, order_by_id[instance.order_id], plans[instance.plan_id], remote_by_id.get((instance.clicd_node, str(instance.clicd_id)))) for instance in instances if instance.order_id in order_by_id and instance.plan_id in plans and order_by_id[instance.order_id].status != "refunded"]
+    renewal_rows = (await db.execute(select(Renewal).where(Renewal.instance_id.in_({instance.id for instance in instances})).order_by(Renewal.id.desc()))).scalars().all() if instances else []
+    latest_renewals: dict[int, Renewal] = {}
+    for renewal in renewal_rows:
+        latest_renewals.setdefault(renewal.instance_id, renewal)
+    cards = [instance_card(instance, order_by_id[instance.order_id], plans[instance.plan_id], remote_by_id.get((instance.clicd_node, str(instance.clicd_id))), latest_renewals.get(instance.id)) for instance in instances if instance.order_id in order_by_id and instance.plan_id in plans and order_by_id[instance.order_id].status != "refunded"]
     jobs = {job.ref_id: job for job in (await db.execute(select(Job).where(Job.kind.in_({"provision", "deliver_card"}), Job.ref_id.in_({order.id for order in orders})))).scalars().all()} if orders else {}
-    return templates.TemplateResponse("dashboard.html", ctx(request, account_user=account_user, orders=orders, cards=cards, plans=plans, jobs=jobs, status_label=safe_status_label, order_status_label=order_status_label))
+    await db.commit()
+    return templates.TemplateResponse("dashboard.html", ctx(request, account_user=account_user, wallet=wallet, orders=orders, cards=cards, plans=plans, jobs=jobs, status_label=safe_status_label, order_status_label=order_status_label, renewal_status_label=renewal_status_label))
 
 
 @app.get("/account", response_class=HTMLResponse)
@@ -929,16 +1172,29 @@ async def account(request: Request, db=Depends(session)):
     plans = {plan.id: plan for plan in (await db.execute(select(Plan).where(Plan.id.in_({order.plan_id for order in orders})))).scalars().all()} if orders else {}
     instances = {instance.order_id: instance for instance in (await db.execute(select(Instance).where(Instance.user_id == account_user.id))).scalars().all()}
     card_items = {item.order_id: item for item in (await db.execute(select(CardItem).where(CardItem.order_id.in_({order.id for order in orders})))).scalars().all()} if orders else {}
+    renewal_rows = (await db.execute(select(Renewal).where(Renewal.user_id == account_user.id).order_by(Renewal.id.desc()).limit(200))).scalars().all()
+    renewals_by_order: dict[int, list[Renewal]] = {}
+    for renewal in renewal_rows:
+        renewals_by_order.setdefault(renewal.order_id, []).append(renewal)
     recent_request_count = await db.scalar(select(func.count(RefundRequest.id)).where(RefundRequest.user_id == account_user.id, RefundRequest.requested_at >= datetime.utcnow() - timedelta(hours=24))) or 0
     order_rows = []
     for order in orders:
         refund = latest_refunds.get(order.id)
+        plan = plans.get(order.plan_id)
+        instance = instances.get(order.id)
+        order_renewals = renewals_by_order.get(order.id, [])
         blocked = bool(refund and (refund.status in REFUND_ACTIVE_STATUSES or refund.status == "completed"))
+        can_renew = bool(order.product_type == "cloud" and order.status == "fulfilled" and plan and plan.product_type == "cloud" and instance and instance.status != "deleted")
         order_rows.append({
             "order": order,
-            "package": snapshot_data(order, plans.get(order.plan_id)) if plans.get(order.plan_id) else {},
-            "instance": instances.get(order.id),
+            "plan": plan,
+            "package": snapshot_data(order, plan) if plan else {},
+            "instance": instance,
             "card_item": card_items.get(order.id),
+            "renewals": order_renewals[:10],
+            "latest_renewal": order_renewals[0] if order_renewals else None,
+            "can_renew": can_renew,
+            "wallet_can_renew": bool(can_renew and wallet.currency == plan.currency and wallet.balance_cents >= plan.price_cents),
             "refund": refund,
             "refund_deadline": refund_deadline(order),
             "can_refund": refund_eligible(order) and not blocked and recent_request_count < REFUND_MAX_REQUESTS_24H,
@@ -953,7 +1209,100 @@ async def account(request: Request, db=Depends(session)):
         refund_requests_remaining=max(0, REFUND_MAX_REQUESTS_24H - recent_request_count),
         order_status_label=order_status_label,
         refund_status_label=refund_status_label,
+        renewal_status_label=renewal_status_label,
     ))
+
+
+@app.post("/instances/{instance_id}/renew")
+async def renew_instance(instance_id: int, request: Request, csrf: str = Form(), payment_method: str = Form("auto"), return_to: str = Form("dashboard"), db=Depends(session)):
+    session_user = guard(request)
+    check_csrf(request, csrf)
+    limit(request, f"renew:{session_user['uid']}", 12, 600)
+    if payment_method not in {"auto", "wallet", "hashpay"}:
+        raise HTTPException(400, "续期支付方式无效")
+    return_to = "account" if return_to == "account" else "dashboard"
+    queued_path = "/account?renewal=queued#orders" if return_to == "account" else "/dashboard?renewal=queued"
+    pending_path = "/account?renewal=in-progress#orders" if return_to == "account" else "/dashboard?renewal=in-progress"
+    async with write_lock:
+        instance = await db.get(Instance, instance_id)
+        if not instance or instance.user_id != session_user["uid"]:
+            raise HTTPException(404)
+        order = await db.get(Order, instance.order_id)
+        plan = await db.get(Plan, instance.plan_id)
+        if not order or not plan or order.user_id != session_user["uid"]:
+            raise HTTPException(404)
+        if order.product_type != "cloud" or plan.product_type != "cloud" or order.status != "fulfilled" or instance.status == "deleted" or not instance.clicd_id or not instance.expires_at:
+            raise HTTPException(409, "该商品不支持续期")
+        if plan.price_cents <= 0:
+            raise HTTPException(409, "套餐续期价格无效")
+        existing = await active_renewal(db, instance.id)
+        if existing:
+            if existing.status == "payment_pending" and existing.checkout_url:
+                return RedirectResponse(existing.checkout_url, 303)
+            if existing.status == "paid":
+                job = (await db.execute(select(Job).where(Job.kind == "renew", Job.ref_id == existing.id))).scalar_one_or_none()
+                if not job:
+                    db.add(Job(kind="renew", ref_id=existing.id))
+                    await db.commit()
+                    return RedirectResponse(queued_path, 303)
+                if job.status == "failed":
+                    job.status, job.attempts, job.error, job.locked_at, job.run_after = "pending", 0, "", None, datetime.utcnow()
+                    existing.error = ""
+                    await db.commit()
+                    return RedirectResponse(queued_path, 303)
+            return RedirectResponse(pending_path, 303)
+        wallet = await ensure_wallet(db, session_user["uid"], plan.currency)
+        selected_method = payment_method
+        if selected_method == "auto":
+            selected_method = "wallet" if wallet.currency == plan.currency and wallet.balance_cents >= plan.price_cents else "hashpay"
+        if selected_method == "wallet":
+            try:
+                renewal = await create_wallet_renewal(db, order, instance, plan, source="manual")
+            except ValueError as exc:
+                await db.rollback()
+                raise HTTPException(409, str(exc)) from exc
+            db.add(Audit(user_id=session_user["uid"], action="renewal.wallet.charged", detail=renewal.renewal_no, ip=request.client.host if request.client else ""))
+            await db.commit()
+            return RedirectResponse(queued_path, 303)
+        renewal = renewal_record(order, instance, plan, "hashpay", "manual")
+        db.add(renewal)
+        await db.commit()
+        await db.refresh(renewal)
+        renewal_id = renewal.id
+        renewal_no = renewal.renewal_no
+    return_path = "/account?renewal=returned#orders" if return_to == "account" else "/dashboard?renewal=returned"
+    try:
+        checkout_url, hashpay_id = await hashpay_checkout(db, renewal_no, plan.price_cents, plan.currency, f"{plan.name} 续期", return_path)
+        renewal = await db.get(Renewal, renewal_id)
+        renewal.checkout_url, renewal.hashpay_id, renewal.status = checkout_url, hashpay_id, "payment_pending"
+        db.add(Audit(user_id=session_user["uid"], action="renewal.hashpay.created", detail=renewal_no, ip=request.client.host if request.client else ""))
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        failed = await db.get(Renewal, renewal_id)
+        if failed:
+            failed.status, failed.error = "payment_error", str(exc)[:1000]
+            await db.commit()
+        logger.exception("续期单 %s 创建 HashPay 支付失败", renewal_no)
+        raise HTTPException(502, f"续期支付创建失败：{exc}") from exc
+    return RedirectResponse(checkout_url, 303)
+
+
+@app.post("/account/orders/{order_id}/auto-renew")
+async def toggle_auto_renew(order_id: int, request: Request, csrf: str = Form(), enabled: bool = Form(False), db=Depends(session)):
+    session_user = guard(request)
+    check_csrf(request, csrf)
+    limit(request, f"auto-renew:{session_user['uid']}", 30, 300)
+    async with write_lock:
+        order = await db.get(Order, order_id)
+        if not order or order.user_id != session_user["uid"]:
+            raise HTTPException(404)
+        if order.product_type != "cloud":
+            raise HTTPException(409, "自动发卡商品不支持续期")
+        order.auto_renew = bool(enabled)
+        db.add(Audit(user_id=session_user["uid"], action="renewal.auto.enabled" if order.auto_renew else "renewal.auto.disabled", detail=order.order_no, ip=request.client.host if request.client else ""))
+        await db.commit()
+    return RedirectResponse(f"/account?auto_renew={'on' if order.auto_renew else 'off'}#orders", 303)
 
 
 @app.post("/account/orders/{order_id}/card-email")

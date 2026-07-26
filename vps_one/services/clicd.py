@@ -34,6 +34,25 @@ def expiration_date(value: date | datetime | str) -> str:
     return value.isoformat()
 
 
+def expiration_datetime(value: Any) -> datetime | None:
+    """Normalize a CLICD expiration value to a naive UTC datetime."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    else:
+        raw = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 def unwrap_data(result: Any) -> Any:
     value = result
     for _ in range(4):
@@ -144,7 +163,8 @@ def container_details(result: Any) -> dict[str, Any]:
         public_ip = str(first.get("address") or first.get("ip") or "") if isinstance(first, dict) else str(first)
     elif isinstance(public, str):
         public_ip = public
-    return {
+    expires_at = expiration_datetime(value.get("expires_at") or value.get("expiry") or value.get("expiration_at"))
+    details = {
         "id": str(value.get("uuid") or value.get("id") or value.get("container_id") or ""),
         "name": str(value.get("name") or value.get("container_name") or ""),
         "virtualization": virtualization,
@@ -155,6 +175,9 @@ def container_details(result: Any) -> dict[str, Any]:
         "ssh_password": str(value.get("ssh_password") or value.get("password") or ""),
         "operating_system": operating_system,
     }
+    if expires_at:
+        details["expires_at"] = expires_at
+    return details
 
 
 def reset_password_value(result: Any) -> str:

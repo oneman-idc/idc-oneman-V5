@@ -68,6 +68,7 @@ class Order(Base):
     status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
     product_type: Mapped[str] = mapped_column(String(16), default="cloud", index=True)
     payment_method: Mapped[str] = mapped_column(String(16), default="hashpay")
+    auto_renew: Mapped[bool] = mapped_column(Boolean, default=True)
     hashpay_id: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
     checkout_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -144,6 +145,36 @@ class WalletTopUp(Base):
     __table_args__ = (CheckConstraint("amount_cents > 0", name="ck_wallet_topup_amount_positive"),)
 
 
+class Renewal(Base):
+    __tablename__ = "renewals"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    renewal_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), index=True)
+    instance_id: Mapped[int] = mapped_column(ForeignKey("instances.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    months: Mapped[int] = mapped_column(Integer, default=1)
+    payment_method: Mapped[str] = mapped_column(String(16), default="wallet")
+    source: Mapped[str] = mapped_column(String(16), default="manual")
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    hashpay_id: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
+    checkout_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    previous_expires_at: Mapped[datetime] = mapped_column(DateTime)
+    new_expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    email_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    __table_args__ = (
+        CheckConstraint("amount_cents > 0", name="ck_renewal_amount_positive"),
+        CheckConstraint("months > 0", name="ck_renewal_months_positive"),
+        Index("ix_renewals_user_status", "user_id", "status"),
+        Index("ix_renewals_instance_status", "instance_id", "status"),
+    )
+
+
 class RefundRequest(Base):
     __tablename__ = "refund_requests"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -190,6 +221,8 @@ class Instance(Base):
     ssh_password: Mapped[str] = mapped_column(Text, default="")
     access_json: Mapped[str] = mapped_column(Text, default="{}")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expiry_notice_for: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    balance_notice_for: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint("clicd_node", "clicd_id", name="uq_instances_clicd_node_id"),)

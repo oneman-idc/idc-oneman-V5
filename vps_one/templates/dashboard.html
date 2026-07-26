@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>服务器管理｜VPS-ONEMAN</title>
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/renewal.css">
   {% include "_ui_head.html" %}
 </head>
 <body>
@@ -14,13 +15,16 @@
   {% if request.query_params.get('password_reset') %}<div class="notice success-text">SSH 密码已重置，完整云主机信息已发送至您的注册邮箱。</div>{% endif %}
   {% if request.query_params.get('mail_failed') %}<div class="notice danger">SSH 密码已成功重置，但邮件发送失败。请联系管理员检查配置。</div>{% endif %}
   {% if request.query_params.get('wallet_purchase') %}<div class="notice success-text">钱包扣款成功，云主机正在自动交付。</div>{% endif %}
+  {% if request.query_params.get('renewal') == 'queued' %}<div class="notice success-text">续期付款已确认，正在同步本地与 CLICD 到期时间。</div>{% endif %}
+  {% if request.query_params.get('renewal') == 'returned' %}<div class="notice">HashPay 支付结果以异步回调为准，到账后会自动更新到期时间。</div>{% endif %}
+  {% if request.query_params.get('renewal') == 'in-progress' %}<div class="notice">该云主机已有续期正在处理，请勿重复付款。</div>{% endif %}
   {% if cards %}<div class="instance-grid simple-grid">
   {% for card in cards %}{% set instance = card.instance %}{% set order = card.order %}{% set package = card.package %}{% set access = card.access %}
   <article class="card simple-instance compact-instance">
     <div class="instance-summary">
       <div><span class="eyebrow">套餐名称</span><h2>{{ package.get('name') or '未返回' }}</h2></div>
       <dl class="summary-facts">
-        <div><dt>到期时间</dt><dd>{{ instance.expires_at.strftime('%Y-%m-%d') if instance.expires_at else '待同步' }}</dd></div>
+        <div class="expiry-summary"><dt>到期时间</dt><dd>{{ instance.expires_at.strftime('%Y-%m-%d') if instance.expires_at else '待同步' }}</dd>{% if card.expired %}<small class="danger-text">已到期</small>{% elif card.expires_soon %}<small class="renewal-warning">剩余 {{ card.days_remaining }} 天，请及时续期</small>{% endif %}{% if card.renewal %}<small class="renewal-state">最近续期：{{ renewal_status_label(card.renewal.status) }}{% if card.renewal.error %} · {{ card.renewal.error }}{% endif %}</small>{% endif %}{% if card.renewal and card.renewal.status in ['pending','payment_pending','paid','processing'] %}{% if card.renewal.checkout_url and card.renewal.status == 'payment_pending' %}<a class="text-link" href="{{ card.renewal.checkout_url }}">继续支付续期单</a>{% endif %}{% else %}<form class="renewal-actions" method="post" action="/instances/{{ instance.id }}/renew"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="return_to" value="dashboard"><button class="btn secondary small" name="payment_method" value="wallet" {% if wallet.currency != card.renewal_currency or wallet.balance_cents < card.renewal_price_cents %}disabled title="钱包余额不足"{% endif %}>钱包续期</button><button class="btn small" name="payment_method" value="hashpay">HashPay 续期</button></form><small class="muted">{{ card.renewal_currency }} {{ '%.2f'|format(card.renewal_price_cents/100) }} / {{ card.renewal_months }} 个月</small>{% endif %}</div>
         <div><dt>订单号</dt><dd><code>{{ order.order_no }}</code></dd></div>
         <div><dt>订单时间</dt><dd>{{ order.created_at.strftime('%Y-%m-%d %H:%M') }}</dd></div>
         <div class="summary-config"><dt>商品基本配置</dt><dd>{{ package.get('cpu') or 0 }} 核 · {{ package.get('memory_mb') or 0 }} MB · {{ package.get('disk_gb') or 0 }} GB · {{ card.virtualization|upper }}</dd></div>

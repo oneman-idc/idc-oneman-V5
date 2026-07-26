@@ -31,8 +31,8 @@ MIGRATIONS = {
     "plans": {
         "slug": "VARCHAR(100)", "features_json": "TEXT NOT NULL DEFAULT '[]'", "product_type": "VARCHAR(16) NOT NULL DEFAULT 'cloud'", "card_delivery_note": "TEXT NOT NULL DEFAULT ''", "stock": "INTEGER NOT NULL DEFAULT -1", "sort_order": "INTEGER NOT NULL DEFAULT 0", "virtualization": "VARCHAR(16) NOT NULL DEFAULT 'lxc'", "network_down_mbps": "INTEGER NOT NULL DEFAULT 100", "network_up_mbps": "INTEGER NOT NULL DEFAULT 50", "io_read_mbps": "INTEGER NOT NULL DEFAULT 0", "io_write_mbps": "INTEGER NOT NULL DEFAULT 0", "assign_nat": "BOOLEAN NOT NULL DEFAULT 1", "port_mapping_count": "INTEGER NOT NULL DEFAULT 2", "assign_ipv4": "BOOLEAN NOT NULL DEFAULT 0", "ipv4_count": "INTEGER NOT NULL DEFAULT 0", "assign_ipv6": "BOOLEAN NOT NULL DEFAULT 1", "ipv6_count": "INTEGER NOT NULL DEFAULT 1", "clicd_node": "VARCHAR(500) NOT NULL DEFAULT ''", "clicd_template_name": "VARCHAR(200) NOT NULL DEFAULT ''", "clicd_validated_at": "DATETIME", "created_at": "DATETIME"
     },
-    "orders": {"plan_snapshot": "TEXT NOT NULL DEFAULT '{}'", "product_type": "VARCHAR(16) NOT NULL DEFAULT 'cloud'", "payment_method": "VARCHAR(16) NOT NULL DEFAULT 'hashpay'", "fulfilled_at": "DATETIME"},
-    "instances": {"clicd_node": "VARCHAR(500) NOT NULL DEFAULT ''", "ipv6": "VARCHAR(100) NOT NULL DEFAULT ''", "management_url": "TEXT NOT NULL DEFAULT ''", "ssh_password": "TEXT NOT NULL DEFAULT ''", "access_json": "TEXT NOT NULL DEFAULT '{}'", "last_synced_at": "DATETIME"},
+    "orders": {"plan_snapshot": "TEXT NOT NULL DEFAULT '{}'", "product_type": "VARCHAR(16) NOT NULL DEFAULT 'cloud'", "payment_method": "VARCHAR(16) NOT NULL DEFAULT 'hashpay'", "auto_renew": "BOOLEAN NOT NULL DEFAULT 1", "fulfilled_at": "DATETIME"},
+    "instances": {"clicd_node": "VARCHAR(500) NOT NULL DEFAULT ''", "ipv6": "VARCHAR(100) NOT NULL DEFAULT ''", "management_url": "TEXT NOT NULL DEFAULT ''", "ssh_password": "TEXT NOT NULL DEFAULT ''", "access_json": "TEXT NOT NULL DEFAULT '{}'", "expiry_notice_for": "DATETIME", "balance_notice_for": "DATETIME", "last_synced_at": "DATETIME"},
     "payment_events": {"platform_txn_id": "VARCHAR(150) NOT NULL DEFAULT ''", "verified": "BOOLEAN NOT NULL DEFAULT 0"},
     "jobs": {"payload": "TEXT NOT NULL DEFAULT '{}'", "locked_at": "DATETIME"},
     "audit_logs": {"ip": "VARCHAR(64) NOT NULL DEFAULT ''"},
@@ -144,6 +144,9 @@ async def migrate(conn):
     await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_plans_product_type ON plans(product_type)"))
     await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_product_type ON orders(product_type)"))
     await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_card_items_plan_status ON card_items(plan_id,status)"))
+    await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_renewals_user_status ON renewals(user_id,status)"))
+    await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_renewals_instance_status ON renewals(instance_id,status)"))
+    await conn.execute(text("UPDATE orders SET auto_renew = 0 WHERE product_type = 'card' AND auto_renew != 0"))
     await conn.execute(text("PRAGMA optimize"))
 
 
