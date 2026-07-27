@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO_URL="${REPO_URL:-https://gitee.com/oneman-idc/idc-oneman.git}"
+REPO_URL="${REPO_URL:-https://github.com/oneman-idc/idc-oneman-V5.git}"
 GITHUB_PROXY="${GITHUB_PROXY:-}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/vps-one}"
 VPS_ONE_PORT="${VPS_ONE_PORT:-9080}"
@@ -71,7 +71,7 @@ prepare_source() {
     [ -n "$GITHUB_PROXY" ] && url="${GITHUB_PROXY%/}/$REPO_URL"
     log "下载源码：$url"
     if ! git clone --depth=1 "$url" "$INSTALL_DIR"; then
-      archive="https://gitee.com/oneman-idc/idc-oneman/archive/refs/heads/main.tar.gz"
+      archive="https://github.com/oneman-idc/idc-oneman-V5/archive/refs/heads/main.tar.gz"
       [ -n "$GITHUB_PROXY" ] && archive="${GITHUB_PROXY%/}/$archive"
       log "Git 拉取失败，尝试源码压缩包"
       tmp="$(mktemp -d)"
